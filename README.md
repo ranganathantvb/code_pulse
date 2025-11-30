@@ -1,6 +1,6 @@
 # Code Pulse
 
-AI-ready Python service with MCP connectors (Git, SonarQube, Jira), pluggable agents, retrieval-augmented generation (RAG) with document upload, and simple memory management. Built with FastAPI and LangChain-friendly components.
+AI-ready Python service with MCP connectors (Git, SonarQube, Jira), pluggable agents, retrieval-augmented generation (RAG) with document upload, and simple memory management. Built with FastAPI and LangChain-friendly components and tuned for local LLMs (Ollama).
 
 ## Features
 - MCP-style connectors: Git metadata fetch, SonarQube issues, Jira search/create (token-based)
@@ -21,7 +21,11 @@ uvicorn code_pulse.app:app --reload
 ### Local LLM (Ollama deepseek-coder)
 - Install Ollama and pull the model: `ollama pull deepseek-coder:6.7b`
 - (optional) set `OLLAMA_BASE_URL` or `OLLAMA_HOST` if not on the default `http://localhost:11434`
-- The agent responder will automatically use the local model; if unavailable and `OPENAI_API_KEY` is set, it falls back to OpenAI.
+- The agent responder only uses the local model (no OpenAI fallback is wired in).
+
+### UI chatbot (optional)
+- No bundled UI is included; the API is ready to be wired to a lightweight chat frontend (e.g., React/Vite or simple HTMX). You can start from the OpenAPI-powered `/docs` page to exercise endpoints, then point a UI at `/agents/run` for chat-style interactions.
+- Typical flow in a UI: maintain a `memory_key` per conversation, send user text as the `task`, set `tools` (e.g., `["git", "sonar", "rag"]`), and render the returned `answer` plus tool outputs.
 
 ## API (high level)
 - `POST /ingest` upload files (multipart) with optional `namespace`
@@ -49,7 +53,24 @@ curl -X POST http://localhost:8000/agents/run \
         }
       }'
 ```
-If `OPENAI_API_KEY` is set, responses are LLM-generated via `langchain-openai`; otherwise a deterministic summary is returned.
+The responder will use your local Ollama model to craft the answer and include any tool outputs in the response.
+
+### Issue/report workflow with an existing repo
+Use the agent to scan repo metadata and issue sources, then ask it for a report:
+```bash
+curl -X POST http://localhost:8000/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{
+        "task": "Scan the repo issues and summarize key risks",
+        "tools": ["git", "sonar"],
+        "memory_key": "issue-audit",
+        "tool_args": {
+          "git": {"owner": "your-org", "repo": "your-repo"},
+          "sonar": {"project_key": "your-org:your-repo"}
+        }
+      }'
+```
+If you also want RAG context from uploaded docs, add the `rag` tool and `namespace`.
 
 ## Configuration
 Environment variables (see `.env.example`):
