@@ -7,8 +7,10 @@ logger = setup_logging(__name__)
 
 
 class MCPClient:
-    def __init__(self, base_url: str, token: Optional[str] = None):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: Any, token: Optional[str] = None):
+        # Accept Pydantic AnyHttpUrl and plain strings.
+        base_url_str = str(base_url)
+        self.base_url = base_url_str.rstrip("/")
         self.token = token
         self._client: Optional[httpx.AsyncClient] = None
 

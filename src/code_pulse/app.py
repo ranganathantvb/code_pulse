@@ -1,7 +1,7 @@
 import io
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,16 @@ class AgentRequest(BaseModel):
     memory_key: str
     namespace: str = Field(default="default")
     tool_args: Optional[Dict[str, Dict[str, str]]] = None
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"message": "Code Pulse API", "docs": "/docs", "health": "/health"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/health")
