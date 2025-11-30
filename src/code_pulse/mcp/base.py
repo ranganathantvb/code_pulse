@@ -28,6 +28,7 @@ class MCPClient:
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         assert self._client, "Client not initialized"
         response = await self._client.get(path, params=params)
+        logger.info("GET %s params=%s status=%s", response.url, params, response.status_code)
         response.raise_for_status()
         return response.json()
 
@@ -36,6 +37,7 @@ class MCPClient:
     ) -> Dict[str, Any]:
         assert self._client, "Client not initialized"
         response = await self._client.post(path, data=data, json=json)
+        logger.info("POST %s status=%s", response.url, response.status_code)
         response.raise_for_status()
         return response.json()
 
