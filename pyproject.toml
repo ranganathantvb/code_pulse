@@ -21,7 +21,6 @@ dependencies = [
     "langchain>=0.2.0",
     "langchain-community>=0.2.0",
     "langchain-text-splitters>=0.2.0",
-    "langchain-openai>=0.1.7",
     "langchain-ollama>=0.1.0",
     "faiss-cpu>=1.7.4",
     "python-multipart>=0.0.9",

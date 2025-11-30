@@ -16,7 +16,7 @@ class Responder:
     def __init__(self):
         self.llm = None
 
-        # Prefer local Ollama deepseek-coder if available, fallback to OpenAI.
+        # Prefer local Ollama deepseek-coder if available; no OpenAI fallback.
         try:
             from langchain_ollama import ChatOllama  # type: ignore
 
@@ -28,15 +28,6 @@ class Responder:
             )
         except Exception:
             self.llm = None
-
-        if self.llm is None:
-            try:
-                from langchain_openai import ChatOpenAI  # type: ignore
-
-                if os.getenv("OPENAI_API_KEY"):
-                    self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-            except Exception:
-                self.llm = None
 
         self.prompt = ChatPromptTemplate.from_template(
             "You are a helpful engineering agent.\n"
