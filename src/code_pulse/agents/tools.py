@@ -6,6 +6,7 @@ from code_pulse.mcp.git import GitClient
 from code_pulse.mcp.sonar import SonarClient
 from code_pulse.mcp.jira import JiraClient
 from code_pulse.rag.service import RAGService
+from code_pulse.config import get_settings, Settings
 
 
 @dataclass
@@ -16,7 +17,8 @@ class ToolResult:
 
 class Tooling:
     def __init__(self):
-        clients = client_factory()
+        self.settings: Settings = get_settings()
+        clients = client_factory(self.settings)
         self.git: GitClient = clients["git"]  # type: ignore[assignment]
         self.sonar: SonarClient = clients["sonar"]  # type: ignore[assignment]
         self.jira: JiraClient = clients["jira"]  # type: ignore[assignment]
@@ -31,7 +33,10 @@ class Tooling:
                 output={"repo": repo_data, "open_prs": pulls},
             )
 
-    async def use_sonar(self, project_key: str) -> ToolResult:
+    async def use_sonar(self, project_key: Optional[str] = None) -> ToolResult:
+        project_key = project_key or self.settings.sonar_project_key
+        if not project_key:
+            raise ValueError("No Sonar project_key provided and SONAR_PROJECT_KEY is not set.")
         async with self.sonar as client:
             issues = await client.project_issues(project_key)
             measures = await client.measures(project_key)
