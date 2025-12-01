@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     sonar_base_url: AnyHttpUrl = Field(default="https://sonarcloud.io/api")
     sonar_token: Optional[str] = None
     sonar_organization: Optional[str] = None
+    sonar_project_key: Optional[str] = None
 
     jira_base_url: AnyHttpUrl = Field(default="https://your-domain.atlassian.net")
     jira_user_email: Optional[str] = None

@@ -75,7 +75,7 @@ If you also want RAG context from uploaded docs, add the `rag` tool and `namespa
 ## Configuration
 Environment variables (see `.env.example`):
 - `GIT_BASE_URL`, `GIT_TOKEN`
-- `SONAR_BASE_URL`, `SONAR_TOKEN`
+- `SONAR_BASE_URL`, `SONAR_TOKEN`, `SONAR_PROJECT_KEY`, `SONAR_ORGANIZATION`
 - `JIRA_BASE_URL`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN`
 - `RAG_EMBEDDINGS_MODEL` (defaults to `sentence-transformers/all-MiniLM-L6-v2` via LangChain)
 - `DATA_DIR` (defaults to `.data`)

@@ -1,0 +1,40 @@
+name: SonarCloud Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  sonarcloud:
+    name: Run SonarCloud analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          # full history -> better analysis & PR decoration
+          fetch-depth: 0
+
+      # 👇 Add your build step here (pick ONE that matches your stack)
+      # - name: Build project (Maven example)
+      #   run: mvn -B verify
+      #
+      - name: Build project (Gradle example)
+        run: ./gradlew build
+      #
+      # - name: Build project (Node example)
+      #   run: npm ci && npm test
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # needed for PR decoration
+        # If you DON'T use sonar-project.properties, uncomment args below:
+        # with:
+        #   args: >
+        #     -Dsonar.organization=ranganathantvb
+        #     -Dsonar.projectKey=ranganathantvb_svc_catalog

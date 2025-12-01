@@ -58,9 +58,10 @@ class AgentRunner:
             if name == "git" and "git" in tool_args:
                 args = tool_args["git"]
                 tasks.append(self.tooling.use_git(args["owner"], args["repo"]))
-            elif name == "sonar" and "sonar" in tool_args:
-                args = tool_args["sonar"]
-                tasks.append(self.tooling.use_sonar(args["project_key"]))
+            elif name == "sonar":
+                args = tool_args.get("sonar", {})
+                project_key = args.get("project_key")
+                tasks.append(self.tooling.use_sonar(project_key))
             elif name == "jira" and "jira" in tool_args:
                 args = tool_args["jira"]
                 tasks.append(self.tooling.use_jira(args["jql"], args.get("create")))
