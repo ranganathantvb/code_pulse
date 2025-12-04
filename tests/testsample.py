@@ -1,14 +1,14 @@
-curl -X POST http://localhost:8000/agents/run \
-  -H "Content-Type: application/json" \
-  -d '{
-        "task": "Scan repo issues and summarize risks",
-        "tools": ["git", "sonar"],
-        "memory_key": "local-chat",
-        "tool_args": {
-          "git": {"owner": "ranganathantvb", "repo": "svc_catalog"},
-          "sonar": {"project_key": "ranganathantvb:svc_catalog"}
-        }
-      }'
+# curl -X POST http://localhost:8000/agents/run \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#         "task": "Scan repo issues and summarize risks",
+#         "tools": ["git", "sonar"],
+#         "memory_key": "local-chat",
+#         "tool_args": {
+#           "git": {"owner": "ranganathantvb", "repo": "svc_catalog"},
+#           "sonar": {"project_key": "ranganathantvb:svc_catalog"}
+#         }
+#       }'
 
 ## format: json below reponse
 
@@ -45,15 +45,28 @@ curl -X POST http://localhost:8000/agents/run \
 # If you need a more detailed report or want to automate this summary, let me know!
 ### Validate the SonarCloud API access separately
 
-curl -i -u "$TOKEN:" \
-  "https://sonarcloud.io/api/authentication/validate"
+# curl -i -u "$TOKEN:" \
+#   "https://sonarcloud.io/api/authentication/validate"
 
 # ### to get the list of projects for organization
-curl -s -u "$SONAR_TOKEN:" \
-  "https://sonarcloud.io/api/projects/search?organization=ranganathantvb" | jq 
+# curl -s -u "$SONAR_TOKEN:" \
+#   "https://sonarcloud.io/api/projects/search?organization=ranganathantvb" | jq 
 
 # ### to get measures for a project
 
-curl --request GET \
-  --url "https://sonarcloud.io/api/measures/component?metricKeys=bugs,vulnerabilities,code_smells&component=ranganathantvb_svc_catalog" \
-  --header "Authorization: Bearer $SONAR_TOKEN"
+# curl --request GET \
+#   --url "https://sonarcloud.io/api/measures/component?metricKeys=bugs,vulnerabilities,code_smells&component=ranganathantvb_svc_catalog" \
+#   --header "Authorization: Bearer $SONAR_TOKEN"
+
+### Generate a secure random string for GITHUB_WEBHOOK_SECRET and AGENT_API_KEY:
+# python3 - <<EOF
+# import secrets
+# print(secrets.token_hex(32))
+# EOF
+
+
+# export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same as in GitHub webhook
+# export GITHUB_TOKEN="your-github-pat"                # PAT with repo access
+# export AGENT_API_KEY="6cf488ac11da5c73fdd4e170401accea13e77762d7659e65f6d4874c2478d4f8"  # optional
+
+# uvicorn webhook_server:app --host 0.0.0.0 --port 9000 --reload
