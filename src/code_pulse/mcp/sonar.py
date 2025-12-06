@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import httpx
 
 from code_pulse.mcp.base import MCPClient
@@ -38,3 +38,35 @@ class SonarClient(MCPClient):
             params["organization"] = self.organization
         data = await self.get("/measures/component", params=params)
         return data.get("component", {}).get("measures", [])
+
+    async def rules(
+        self,
+        query: Optional[str] = None,
+        languages: Optional[str] = None,
+        severities: Optional[str] = None,
+        types: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """Fetch Sonar rules for downstream ingestion (e.g., RAG training)."""
+        params: Dict[str, Any] = {"p": page, "ps": page_size}
+        if query:
+            params["q"] = query
+        if languages:
+            params["languages"] = languages
+        if severities:
+            params["severities"] = severities
+        if types:
+            params["types"] = types
+        if self.organization:
+            params["organization"] = self.organization
+
+        data = await self.get("/rules/search", params=params)
+        return {
+            "rules": data.get("rules", []),
+            "paging": {
+                "page": data.get("p", page),
+                "page_size": data.get("ps", page_size),
+                "total": data.get("total", len(data.get("rules", []))),
+            },
+        }
