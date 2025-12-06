@@ -9,6 +9,7 @@ from code_pulse.agents import AgentRunner
 from code_pulse.logger import setup_logging
 from code_pulse.memory import MemoryStore
 from code_pulse.rag.service import RAGService
+from code_pulse.mcp.sonar_mcp_server import router as sonar_router
 
 logger = setup_logging(__name__)
 
@@ -20,6 +21,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(sonar_router)
 
 rag_service = RAGService()
 agent_runner = AgentRunner()
