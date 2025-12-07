@@ -1,3 +1,4 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from code_pulse.config import Settings, get_settings
@@ -34,6 +35,15 @@ async def fetch_rules(
                 page=page,
                 page_size=page_size,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                detail = exc.response.text
+            except Exception:  # noqa: BLE001
+                detail = str(exc)
+            raise HTTPException(status_code=exc.response.status_code, detail=detail)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to fetch Sonar rules")
             raise HTTPException(status_code=502, detail=str(exc))

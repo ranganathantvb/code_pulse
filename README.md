@@ -33,6 +33,38 @@ uvicorn code_pulse.app:app --reload
 - `POST /agents/run` run an agent with `task`, `tools` (git|sonar|jira|rag), `memory_key`, `namespace`
 - `GET /memory/{memory_key}` inspect stored messages
 
+### Seed Sonar rules into RAG
+If you already have exported Sonar rule JSON (e.g., `.data/ingest/sonarr_rule_data.json`), you can index it for RAG answers:
+```bash
+source .venv/bin/activate
+python -m code_pulse.rag.seed_sonar_rules  # accepts Enter for default path/namespace
+```
+This stores chunks under the `sonar` namespace by default. When invoking the agent with the `sonar` tool, pass your question (and namespace if you changed it) in `tool_args` so it can pull RAG matches.
+
+## RAG how-to (setup, train, run, test)
+- **Install + env**: `python -m venv .venv && source .venv/bin/activate && pip install -e .`; copy `.env.example` to `.env` and fill tokens/URLs (Sonar/Git/Jira as needed).
+- **Train (ingest) Sonar rules**: place your rules export at `.data/ingest/sonarr_rule_data.json` (or another path), then run `python -m code_pulse.rag.seed_sonar_rules` and accept defaults (namespace `sonar`). Re-run this command whenever you refresh rules.
+- **Run API**: `uvicorn code_pulse.app:app --reload`; Swagger at `http://localhost:8000/docs`.
+- **Direct RAG query**: after seeding, call `POST /rag/query` with `{"question": "How to fix TLS 1.0 issues?", "namespace": "sonar"}`.
+- **Agent with Sonar RAG**: `POST /agents/run`:
+  ```bash
+  curl -X POST http://localhost:8000/agents/run \
+    -H "Content-Type: application/json" \
+    -d '{
+          "task": "Explain how to remediate weak TLS in my Sonar findings",
+          "tools": ["sonar"],
+          "memory_key": "sonar-chat",
+          "tool_args": {
+            "sonar": {
+              "question": "TLS 1.0 finding remediation",
+              "namespace": "sonar"
+            }
+          }
+        }'
+  ```
+  The agent will pull RAG matches from the `sonar` namespace; if nothing relevant is found it responds politely that guidance is unavailable.
+- **Run tests**: `pytest -q` (after installing deps). Add more RAG tests as needed.
+
 ### RAG workflow
 1. `POST /ingest` with files: `curl -F "files=@docs/guide.pdf" -F "namespace=demo" http://localhost:8000/ingest`
 2. `POST /rag/query` with JSON: `{"question": "How to deploy?", "namespace": "demo"}`
@@ -90,3 +122,24 @@ pytest -q
 - Networked APIs are thin wrappers; enable/disable per deployment.
 - RAG artifacts and memory live under `.data` by default.
 - Extend agents or connectors by adding new tool classes in `code_pulse/agents/tools`.
+
+
+#### How to start 
+<!-- set -a          # auto-export all variables
+source .env
+set +a -->
+
+## terminal 1
+# export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same as in GitHub webhook
+# export GITHUB_TOKEN="your-github-pat"                # PAT with repo access
+# export AGENT_API_KEY="6cf488ac11da5c73fdd4e170401accea13e77762d7659e65f6d4874c2478d4f8"  # optional
+# uvicorn webhook_server:app --host 0.0.0.0 --port 9000 --reload
+
+## terminal 2
+# ngrok http 9000  
+
+## terminal 3
+# uvicorn code_pulse.app:app --reload    
+
+## terminal 4
+# test using the curl
