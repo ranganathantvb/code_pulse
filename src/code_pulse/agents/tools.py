@@ -33,14 +33,35 @@ class Tooling:
                 output={"repo": repo_data, "open_prs": pulls},
             )
 
-    async def use_sonar(self, project_key: Optional[str] = None) -> ToolResult:
+    async def use_sonar(self, project_key: Optional[str] = None, question: str = "", namespace: str = "sonar") -> ToolResult:
+        # Always try RAG for Sonar guidance.
+        rag_docs = self.rag.query(question or "sonar issue", namespace=namespace)
+        rag_matches = [
+            {"page_content": doc.page_content, "metadata": doc.metadata}
+            for doc in rag_docs
+        ]
+
+        # Pull live Sonar data if configured.
         project_key = project_key or self.settings.sonar_project_key
-        if not project_key:
-            raise ValueError("No Sonar project_key provided and SONAR_PROJECT_KEY is not set.")
-        async with self.sonar as client:
-            issues = await client.project_issues(project_key)
-            measures = await client.measures(project_key)
-            return ToolResult(name="sonar", output={"issues": issues, "measures": measures})
+        issues = measures = None
+        if project_key:
+            async with self.sonar as client:
+                issues = await client.project_issues(project_key)
+                measures = await client.measures(project_key)
+
+        message = None
+        if not rag_matches:
+            message = "No matching Sonar guidance found in the knowledge base."
+
+        return ToolResult(
+            name="sonar",
+            output={
+                "rag_matches": rag_matches,
+                "issues": issues,
+                "measures": measures,
+                "message": message,
+            },
+        )
 
     async def use_jira(
         self, jql: str, create: Optional[Dict[str, str]] = None
@@ -63,4 +84,5 @@ class Tooling:
             {"page_content": doc.page_content, "metadata": doc.metadata}
             for doc in docs
         ]
-        return ToolResult(name="rag", output={"matches": excerpts})
+        message = None if excerpts else "No relevant documents found."
+        return ToolResult(name="rag", output={"matches": excerpts, "message": message})

@@ -61,7 +61,10 @@ class AgentRunner:
             elif name == "sonar":
                 args = tool_args.get("sonar", {})
                 project_key = args.get("project_key")
-                tasks.append(self.tooling.use_sonar(project_key))
+                question = args.get("question") or args.get("task") or ""
+                # Use the same namespace for RAG; default to "sonar" if not set.
+                sonar_namespace = args.get("namespace") or namespace or "sonar"
+                tasks.append(self.tooling.use_sonar(project_key, question=question or "", namespace=sonar_namespace))
             elif name == "jira" and "jira" in tool_args:
                 args = tool_args["jira"]
                 tasks.append(self.tooling.use_jira(args["jql"], args.get("create")))

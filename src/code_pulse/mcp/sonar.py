@@ -16,12 +16,10 @@ class SonarClient(MCPClient):
         return raw_key
 
     async def __aenter__(self) -> "SonarClient":
-        headers = {
-            "User-Agent": "code-pulse/0.1.0",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        self._client = httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=20.0)
+        headers = {"User-Agent": "code-pulse/0.1.0"}
+        auth = httpx.BasicAuth(self.token, "") if self.token else None
+        # SonarQube/SonarCloud expect token via HTTP Basic with empty password.
+        self._client = httpx.AsyncClient(base_url=self.base_url, headers=headers, auth=auth, timeout=20.0)
         return self
 
     async def project_issues(self, project_key: str, statuses: str = "OPEN") -> Dict[str, Any]:
@@ -61,7 +59,29 @@ class SonarClient(MCPClient):
         if self.organization:
             params["organization"] = self.organization
 
-        data = await self.get("/rules/search", params=params)
+        try:
+            data = await self.get("/rules/search", params=params)
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                payload = exc.response.json()
+                if isinstance(payload, dict) and "errors" in payload:
+                    detail = "; ".join(
+                        e.get("msg", "") for e in payload.get("errors", []) if isinstance(e, dict)
+                    )
+            except Exception:  # noqa: BLE001
+                detail = exc.response.text
+
+            if self.organization and exc.response.status_code == 404:
+                raise ValueError(
+                    f"Sonar organization '{self.organization}' not found or inaccessible: {detail}"
+                ) from exc
+            if self.organization and exc.response.status_code == 400 and "organization" in detail.lower():
+                raise ValueError(
+                    f"Sonar organization '{self.organization}' is required or invalid: {detail}"
+                ) from exc
+            raise
+
         return {
             "rules": data.get("rules", []),
             "paging": {
