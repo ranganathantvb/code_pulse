@@ -13,6 +13,8 @@ jobs:
     env:
       PYTHON_VERSION: "3.11"
       SONAR_HOST_URL: "https://sonarcloud.io"
+      PIP_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu"  # ensure CPU wheels for torch/sentence-transformers to keep size down
+      PIP_NO_CACHE_DIR: "1"
 
     steps:
       - name: Checkout source
@@ -29,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install --no-cache-dir -e ".[test]"
 
       - name: Run tests
         run: pytest -q
