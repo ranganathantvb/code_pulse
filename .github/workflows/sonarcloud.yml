@@ -10,6 +10,9 @@ jobs:
   sonarcloud:
     name: Run SonarCloud analysis
     runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: "3.11"
+      SONAR_HOST_URL: "https://sonarcloud.io"
 
     steps:
       - name: Checkout source
@@ -18,23 +21,32 @@ jobs:
           # full history -> better analysis & PR decoration
           fetch-depth: 0
 
-      # 👇 Add your build step here (pick ONE that matches your stack)
-      # - name: Build project (Maven example)
-      #   run: mvn -B verify
-      #
-      - name: Build project (Gradle example)
-        run: ./gradlew build
-      #
-      # - name: Build project (Node example)
-      #   run: npm ci && npm test
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # needed for PR decoration
-        # If you DON'T use sonar-project.properties, uncomment args below:
-        # with:
-        #   args: >
-        #     -Dsonar.organization=ranganathantvb
-        #     -Dsonar.projectKey=ranganathantvb_svc_catalog
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION || secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.python.version=${{ env.PYTHON_VERSION }}
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.test.inclusions=tests/**
+            -Dsonar.exclusions=**/__pycache__/**,**/*.pyc
