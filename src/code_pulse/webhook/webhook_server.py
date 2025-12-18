@@ -2,6 +2,7 @@ import hmac
 import hashlib
 import os
 import logging
+from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -32,6 +33,17 @@ AGENT_API_TIMEOUT = _get_float_env("AGENT_API_TIMEOUT", 30.0)
 WEBHOOK_PATH = "/webhook-9d83cbbcf7f1"  # random path to hide endpoint
 
 
+def _truncate(value: bytes | str | None, limit: int = 1000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            value = str(value)
+    return value if len(value) <= limit else f"{value[:limit]}... [truncated]"
+
+
 # ------------------------------
 # SECURITY: VERIFY WEBHOOK SIGNATURE
 # ------------------------------
@@ -56,16 +68,24 @@ def verify_github_signature(raw_body: bytes, signature_header: str | None) -> No
 # ------------------------------
 # CALL YOUR AGENT ENDPOINT
 # ------------------------------
-async def call_agent(task: str) -> str:
+def _resolve_project_key(owner: str, repo: str) -> str:
+    return os.getenv("SONAR_PROJECT_KEY") or f"{owner}:{repo}"
+
+
+async def call_agent(
+    task: str,
+    tools: Optional[List[str]] = None,
+    tool_args: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
     """Call your /agents/run API with the correct request format."""
 
     payload = {
         "task": task,
-        "tools": ["sonar"],
+        "tools": tools or ["sonar"],
         "memory_key": "local-chat",
-        "tool_args": {
+        "tool_args": tool_args or {
             "sonar": {"project_key": "ranganathantvb:svc_catalog"}
-        }
+        },
     }
 
     headers = {"Content-Type": "application/json"}
@@ -98,6 +118,8 @@ async def call_agent(task: str) -> str:
         )
 
         # Try different keys based on your API output
+        if "answer" in data:
+            return data["answer"]
         if "output" in data:
             return data["output"]
         if "comment" in data:
@@ -161,12 +183,24 @@ async def github_webhook(
     x_hub_signature_256: str | None = Header(None),
 ):
     raw_body = await request.body()
+    logger.info("Webhook raw body %s", _truncate(raw_body, 1500))
 
     # 1️⃣ Validate GitHub signature
     verify_github_signature(raw_body, x_hub_signature_256)
 
     # 2️⃣ Read event
     payload = await request.json()
+    repo_full = payload.get("repository", {}).get("full_name")
+    pr_number = payload.get("pull_request", {}).get("number")
+    issue_number = payload.get("issue", {}).get("number")
+    logger.info(
+        "Webhook request event=%s action=%s repo=%s pr=%s issue=%s",
+        x_github_event,
+        payload.get("action"),
+        repo_full,
+        pr_number,
+        issue_number,
+    )
 
     if x_github_event == "pull_request":
         action = payload.get("action")
@@ -180,7 +214,15 @@ async def github_webhook(
 
             # 3️⃣ Call your agent (Sonar scan + git)
             agent_output = await call_agent(
-                f"Summarize Sonar issues and key risks for {owner}/{name}"
+                f"Summarize Sonar issues and key risks for {owner}/{name}",
+                tools=["git", "sonar"],
+                tool_args={
+                    "git": {"owner": owner, "repo": name, "pull_number": pr_number},
+                    "sonar": {
+                        "project_key": _resolve_project_key(owner, name),
+                        "pull_request": pr_number,
+                    },
+                },
             )
 
             # 4️⃣ Post comment back to PR
@@ -218,7 +260,20 @@ async def github_webhook(
                 },
             )
 
-            agent_output = await call_agent(command_text)
+            pr_number = issue_number if issue.get("pull_request") else None
+            git_args: Dict[str, Any] = {"owner": owner, "repo": name}
+            sonar_args: Dict[str, Any] = {"project_key": _resolve_project_key(owner, name)}
+            if pr_number:
+                git_args["pull_number"] = pr_number
+                sonar_args["pull_request"] = pr_number
+
+            agent_output = await call_agent(
+                command_text,
+                tools=["git", "sonar"],
+                tool_args={"git": git_args, "sonar": sonar_args},
+            )
             await post_comment(owner, name, issue_number, _with_completion_footer(agent_output))
 
-    return {"status": "ok"}
+    response_payload = {"status": "ok"}
+    logger.info("Webhook response %s", response_payload)
+    return response_payload

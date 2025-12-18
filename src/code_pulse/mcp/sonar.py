@@ -29,6 +29,49 @@ class SonarClient(MCPClient):
             params["organization"] = self.organization
         return await self.get("/issues/search", params=params)
 
+    async def pr_issues(
+        self,
+        project_key: str,
+        pull_request: str,
+        statuses: str = "OPEN",
+        issue_types: str | None = None,
+    ) -> Dict[str, Any]:
+        component = self._component_key(project_key)
+        params: Dict[str, Any] = {
+            "componentKeys": component,
+            "pullRequest": pull_request,
+            "statuses": statuses,
+        }
+        if issue_types:
+            params["types"] = issue_types
+        if self.organization:
+            params["organization"] = self.organization
+        return await self.get("/issues/search", params=params)
+
+    async def pr_hotspots(
+        self,
+        project_key: str,
+        pull_request: str,
+        status: str | None = None,
+    ) -> Dict[str, Any]:
+        component = self._component_key(project_key)
+        params: Dict[str, Any] = {
+            "projectKey": component,
+            "pullRequest": pull_request,
+        }
+        if status:
+            params["status"] = status
+        if self.organization:
+            params["organization"] = self.organization
+        return await self.get("/hotspots/search", params=params)
+
+    async def pr_quality_gate(self, project_key: str, pull_request: str) -> Dict[str, Any]:
+        component = self._component_key(project_key)
+        params: Dict[str, Any] = {"projectKey": component, "pullRequest": pull_request}
+        if self.organization:
+            params["organization"] = self.organization
+        return await self.get("/qualitygates/project_status", params=params)
+
     async def measures(self, project_key: str, metric_keys: str = "bugs,vulnerabilities,code_smells") -> List[Dict[str, Any]]:
         component = self._component_key(project_key)
         params = {"component": component, "metricKeys": metric_keys}
@@ -36,6 +79,19 @@ class SonarClient(MCPClient):
             params["organization"] = self.organization
         data = await self.get("/measures/component", params=params)
         return data.get("component", {}).get("measures", [])
+
+    async def projects(
+        self,
+        query: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"p": page, "ps": page_size}
+        if query:
+            params["q"] = query
+        if self.organization:
+            params["organization"] = self.organization
+        return await self.get("/projects/search", params=params)
 
     async def rules(
         self,
