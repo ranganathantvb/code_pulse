@@ -28,5 +28,30 @@ class GitClient(MCPClient):
     async def pull_requests(self, owner: str, repo: str, state: str = "open") -> List[Dict[str, Any]]:
         return await self.get(f"/repos/{owner}/{repo}/pulls", params={"state": state})
 
+    async def pull_request(self, owner: str, repo: str, number: int) -> Dict[str, Any]:
+        return await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
+
+    async def pull_request_files(
+        self, owner: str, repo: str, number: int, per_page: int = 100
+    ) -> List[Dict[str, Any]]:
+        files: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = await self.get(
+                f"/repos/{owner}/{repo}/pulls/{number}/files",
+                params={"page": page, "per_page": per_page},
+            )
+            files.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        return files
+
+    async def commit_status(self, owner: str, repo: str, ref: str) -> Dict[str, Any]:
+        return await self.get(f"/repos/{owner}/{repo}/commits/{ref}/status")
+
+    async def check_runs(self, owner: str, repo: str, ref: str) -> Dict[str, Any]:
+        return await self.get(f"/repos/{owner}/{repo}/commits/{ref}/check-runs")
+
     async def commits(self, owner: str, repo: str, branch: str = "main") -> List[Dict[str, Any]]:
         return await self.get(f"/repos/{owner}/{repo}/commits", params={"sha": branch})

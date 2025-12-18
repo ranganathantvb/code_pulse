@@ -130,10 +130,10 @@ source .env
 set +a -->
 
 ## terminal 1
-# export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same as in GitHub webhook
-# export GITHUB_TOKEN="your-github-pat"                # PAT with repo access
-# export AGENT_API_KEY="6cf488ac11da5c73fdd4e170401accea13e77762d7659e65f6d4874c2478d4f8"  # optional
-# uvicorn webhook_server:app --host 0.0.0.0 --port 9000 --reload
+ <!-- export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same as in GitHub webhook
+ export GITHUB_TOKEN="your-github-pat"                # PAT with repo access
+ export AGENT_API_KEY="6cf488ac11da5c73fdd4e170401accea13e77762d7659e65f6d4874c2478d4f8"  # optional
+ uvicorn webhook_server:app --host 0.0.0.0 --port 9000 --reload -->
 
 ## terminal 2
 # ngrok http 9000  
