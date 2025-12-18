@@ -17,3 +17,7 @@ def setup_logging(name: Optional[str] = None, level: int = logging.INFO) -> logg
         logger.addHandler(handler)
     logger.setLevel(level)
     return logger
+
+
+# Shared default logger for modules that only need a simple logger instance.
+logger = setup_logging("code_pulse")

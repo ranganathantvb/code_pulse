@@ -1,5 +1,5 @@
 import io
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +38,7 @@ class AgentRequest(BaseModel):
     tools: List[str]
     memory_key: str
     namespace: str = Field(default="default")
-    tool_args: Optional[Dict[str, Dict[str, str]]] = None
+    tool_args: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @app.get("/", include_in_schema=False)
