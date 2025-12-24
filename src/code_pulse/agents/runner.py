@@ -3,8 +3,10 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# --- ADDITIVE: avoid HF tokenizers fork warning/deadlocks ---
+import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -104,26 +106,17 @@ class Responder:
             separator = "\n" if not answer.endswith("\n") else ""
             answer = f"{answer}{separator}{branch_line}"
 
-        # Enforce truthful reporting for fix requests: no commit/applied -> justification mode.
+        logger.info("Model response %s", self._truncate(answer, 800))
+        # --- ADDITIVE: If fixes requested but local_fix reports none applied, append a truthful note ---
         try:
+            wants_fix = ("fix" in task.lower()) or ("apply the changes" in task.lower()) or ("apply changes" in task.lower())
             if wants_fix and ("local_fix" in context):
-                no_commit = ("'commit': None" in context) or ('"commit": None' in context) or ("commit': None" in context)
-                no_applied = ("'applied': []" in context) or ('\"applied\": []' in context) or ("applied=0" in context)
-                if no_commit or no_applied:
-                    justification_lines = [
-                        "No automatic fixes were applied because patches could not be safely generated or applied. See tool output for exact git apply/model diff reasons."
-                    ]
-                    failed = re.findall(r"'file': '([^']+)'.*?'reason': '([^']+)'", context)
-                    if failed:
-                        justification_lines.append("Top failed files:")
-                        for file_name, reason in failed[:3]:
-                            justification_lines.append(f"- {file_name}: {reason}")
-                    justification = "\n".join(justification_lines)
-                    answer = answer.rstrip() + "\n\n" + justification
+                if ("'applied': []" in context) or ("applied=0" in context) or ("'commit': None" in context):
+                    note = "Note: No automatic fixes were applied because a valid safe unified diff could not be generated; the branch may still exist for manual review."
+                    if note not in answer:
+                        answer = answer.rstrip() + "\n\n" + note
         except Exception:
             pass
-
-        logger.info("Model response %s", self._truncate(answer, 800))
 
         return answer
 
@@ -252,12 +245,6 @@ class AgentRunner:
                     local_fix = await self.tooling.fix_sonar_locally(task, sonar_res.output)
                     results.append(local_fix)
                     logger.info("Local fix result: %s", local_fix.output)
-
-                    git_res = next((r for r in results if r.name == "git"), None)
-                    if git_res and isinstance(git_res.output, dict):
-                        pr_comment = await self.tooling.comment_pr_with_branch(task, git_res.output, local_fix.output)
-                        results.append(pr_comment)
-                        logger.info("PR comment result: %s", pr_comment.output)
                 except Exception as exc:
                     logger.exception("Local fix failed")
                     results.append(ToolResult(name="local_fix", output={"error": str(exc)}))
