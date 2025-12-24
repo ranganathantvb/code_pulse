@@ -263,6 +263,16 @@ class Tooling:
                 return component[len(project_key):].lstrip("/\\")
             return component
 
+        def _new_file_target(diff_text: str) -> Optional[str]:
+            """Return target path if diff creates a new file (--- /dev/null to +++ b/path)."""
+            if not diff_text:
+                return None
+            new_file_match = re.search(r"^\+\+\+\s+b/([^\n]+)", diff_text, flags=re.M)
+            creates_file = re.search(r"^---\s+/dev/null", diff_text, flags=re.M)
+            if new_file_match and creates_file:
+                return new_file_match.group(1).strip()
+            return None
+
         def _windowed_lines(content: str, start_line: int, radius: int = 60) -> Tuple[int, int, str]:
             lines = content.splitlines()
             start_idx = max(0, start_line - 1 - radius)
@@ -367,22 +377,67 @@ class Tooling:
             win_start, win_end, window = _windowed_lines(content, start_line=start_line, radius=60)
 
             rule = f.get("rule") or "SONAR_RULE"
-            rag_docs = self.rag.query(f"How to fix Sonar rule {rule}", namespace="sonar")
+            rag_query = f"How to fix Sonar rule {rule}"
+            logger.info("RAG retrieval: query='%s', namespace='sonar'", rag_query)
+            rag_docs = self.rag.query(rag_query, namespace="sonar")
             rag_excerpt = "\n\n".join(d.page_content[:800] for d in rag_docs[:3])
+            logger.info("RAG retrieved %d chunk(s) for rule %s", len(rag_docs), rule)
+            for idx, doc in enumerate(rag_docs[:3]):
+                logger.info("RAG chunk %d for rule %s: %s", idx + 1, rule, doc.page_content[:300].replace("\n", " "))
 
             prompt = (
-                "You are an automated remediation agent.\n"
-                "Output ONLY a unified diff (git-style) that applies cleanly with `git apply`.\n"
-                "Do NOT create new files. Use headers --- a/<path> and +++ b/<path> with @@ hunks.\n"
-                "Minimize changes; avoid functional regressions. Prefer minimal, safe edits for hotspots (validation, safe APIs, annotations).\n"
-                "Avoid suppressions like NOSONAR unless unavoidable.\n\n"
-                f"Finding:\n- Kind: {f.get('kind')}\n- Rule: {rule}\n- Message: {f.get('message') or ''}\n- File: {rel_path}\n- Line: {start_line}\n\n"
-                f"Guidance:\n{rag_excerpt}\n\n"
-                f"File excerpt (lines {win_start}-{win_end}):\n{window}\n"
+                "You are a local code remediation agent running inside a developer workstation with read/write access to the repository.\n"
+                "Your goal is to fix the provided Sonar findings by editing files locally and validating the changes.\n\n"
+                "INPUTS YOU WILL RECEIVE:\n"
+                "1) Sonar Findings (rule, message, file path, and ideally the line range)\n"
+                "2) RAG Content (rule guidance and remediation patterns)\n"
+                "3) Current code context (either the full file content or at minimum the exact method(s) and surrounding lines)\n\n"
+                "IMPORTANT CONSTRAINTS:\n"
+                "- Do NOT output a unified diff or patch in the narrative sections.\n"
+                "- Create fixes in new files prefixed with 'AI_' (e.g., AI_<OriginalName>.java) instead of modifying the original file directly unless a minimal wiring change is unavoidable.\n"
+                "- Prefer minimal changes that compile and preserve behavior.\n"
+                "- Avoid suppressions (NOSONAR / @SuppressWarnings) unless there is no safe alternative.\n"
+                "- Apply fixes for the actual rule intent; do not add unrelated validation unless it directly addresses the issue.\n"
+                "- Keep edits localized; if you must touch the original file, only add minimal glue to use the new AI_ file.\n\n"
+                "WORKFLOW YOU MUST FOLLOW:\n"
+                "A) Identify exactly where each Sonar issue occurs in the provided code context.\n"
+                "B) Choose the least risky remediation that satisfies the rule:\n"
+                "   - java:S2119 “Save and re-use this Random”: avoid per-call new Random(); use ThreadLocalRandom OR reuse a static final Random if appropriate.\n"
+                "   - java:S2245 “Pseudorandom generator safety”: if used for security, use SecureRandom; if not security-sensitive, use ThreadLocalRandom and explicitly keep it non-security.\n"
+                "   - java:S4790 “Weak hash algorithm”: if used for passwords or security, replace with a stronger construct (bcrypt/PBKDF2/HMAC-SHA-256 depending on usage); if non-security integrity/dedup, prefer SHA-256.\n"
+                "C) Edit the file(s) locally using direct file writes (you can describe the edits explicitly).\n"
+                "D) Run local verification commands (compile/tests). If tests fail, fix and re-run.\n"
+                "E) Report exactly what you changed and why, mapping each change to a Sonar rule.\n\n"
+                "OUTPUT FORMAT (STRICT):\n"
+                "1) PLAN\n"
+                "   - Bullet list of issues to fix and chosen remediation per rule.\n"
+                "2) EDITS TO APPLY (LOCAL)\n"
+                "   For each file:\n"
+                "   - File path (use AI_ prefixed files for new code; minimal glue in originals only if required)\n"
+                "   - “Before” snippet (only the relevant lines/method)\n"
+                "   - “After” snippet (only the updated lines/method)\n"
+                "   - Explanation of why this satisfies the rule\n"
+                "3) COMMANDS TO RUN\n"
+                "   - Commands to format (if applicable), compile, and test (e.g., mvn -q -DskipTests=false test)\n"
+                "4) VALIDATION RESULTS\n"
+                "   - State what would be checked (build/tests/sonar scan), and any expected side-effects.\n"
+                "   - If any uncertainty remains because code context is incomplete, state what additional context is needed (but still provide best-effort edits based on what was provided).\n\n"
+                "NOW FIX THESE FINDINGS USING THE RAG CONTENT BELOW AND THE PROVIDED CODE CONTEXT.\n\n"
+                "SONAR FINDINGS:\n"
+                f"- Kind: {f.get('kind')}\n- Rule: {rule}\n- Message: {f.get('message') or ''}\n- File: {rel_path}\n- Line: {start_line}\n\n"
+                "RAG CONTENT (RULE GUIDANCE):\n"
+                f"{rag_excerpt}\n\n"
+                "CODE CONTEXT (CURRENT FILE CONTENT OR RELEVANT METHOD(S)):\n"
+                f"{window}\n\n"
+                "REPOSITORY ROOT PATH:\n"
+                f"{workspace_path}\n\n"
+                "After producing the PLAN/EDITS/COMMANDS/VALIDATION sections above, output ONLY the final unified diff (git-style) that applies cleanly with `git apply`, using headers --- a/<path> and +++ b/<path> with @@ hunks, and nothing else after the diff. For new files, ensure the path starts with AI_ and is placed alongside the original."
             )
+            logger.info("Prompt sent to LLM for rule %s: %s", rule, prompt[:500].replace("\n", " "))
 
             try:
                 raw = await chain.ainvoke({"prompt": prompt})
+                logger.info("Raw LLM response for rule %s: %s", rule, raw[:500].replace("\n", " "))
                 diff_text = extract_unified_diff(raw)
                 if not is_valid_unified_diff(diff_text):
                     retry_prompt = prompt + (
@@ -390,6 +445,7 @@ class Tooling:
                         "Use headers exactly like '--- a/{path}' and '+++ b/{path}' and include '@@' hunk headers. No explanations."
                     )
                     raw2 = await chain.ainvoke({"prompt": retry_prompt})
+                    logger.info("Raw LLM retry response for rule %s: %s", rule, raw2[:500].replace("\n", " "))
                     diff_text = extract_unified_diff(raw2)
             except Exception as exc:
                 logger.exception("LLM invocation failed for %s", rel_path)
@@ -401,7 +457,13 @@ class Tooling:
                 skipped.append({"file": rel_path, "reason": "Model did not produce a valid unified diff"})
                 continue
 
-            if diff_creates_file(diff_text):
+            new_file_target = _new_file_target(diff_text)
+            if new_file_target:
+                if not os.path.basename(new_file_target).startswith("AI_"):
+                    logger.warning("Model diff attempts to create new file '%s' without AI_ prefix; skipping", new_file_target)
+                    skipped.append({"file": new_file_target, "reason": "New files must use AI_ prefix"})
+                    continue
+            elif diff_creates_file(diff_text):
                 logger.warning("Model diff attempts to create a file for %s; skipping", rel_path)
                 skipped.append({"file": rel_path, "reason": "Model diff attempted to create a new file"})
                 continue
@@ -443,7 +505,7 @@ class Tooling:
                 if rel_path not in changed_files:
                     changed_files.append(rel_path)
                 applied.append({"file": rel_path, "rule": rule, "kind": f.get("kind")})
-                logger.info("Applied diff to %s", rel_path)
+                logger.info("✅ Change applied to file: '%s'\n- Rule: %s\n- Type: %s\n- Workspace: %s\n- Branch: %s\n- Patch Preview:\n%s", rel_path, rule, f.get("kind"), workspace_path, branch, diff_text[:500])
             except Exception as exc:
                 logger.warning("Patch apply failed for %s: %s", rel_path, exc)
                 skipped.append({"file": rel_path, "reason": f"Patch apply failed: {exc}"})
@@ -454,16 +516,24 @@ class Tooling:
                     except Exception:
                         pass
 
-        logger.info("Apply summary: changed_files=%d applied=%d skipped=%d", len(changed_files), len(applied), len(skipped))
+        logger.info("Summary of changes:\n- Total files changed: %d\n- Total fixes applied: %d\n- Total skipped: %d", len(changed_files), len(applied), len(skipped))
 
         commit_hash = None
+        push_status = None
         try:
             status = _run_cmd(["git", "status", "--porcelain"], cwd=workspace_path, check=False).stdout.strip()
             if status:
                 _run_cmd(["git", "add", "-A"], cwd=workspace_path)
                 _run_cmd(["git", "commit", "-m", "Fix Sonar issues (CodePulse)"], cwd=workspace_path)
                 commit_hash = _run_cmd(["git", "rev-parse", "HEAD"], cwd=workspace_path, check=True).stdout.strip()
-                logger.info("Commit created: %s", commit_hash)
+                logger.info("📝 All changes have been committed to branch '%s'.\n- Commit hash: %s", branch, commit_hash)
+                try:
+                    push = _run_cmd(["git", "push", "-u", "origin", branch], cwd=workspace_path, check=False)
+                    push_status = push.stdout.strip() or push.stderr.strip() or "pushed"
+                    logger.info("Push attempt result: %s", push_status)
+                except subprocess.CalledProcessError as exc:
+                    push_status = f"push failed: {exc.stderr or exc.stdout}"
+                    logger.warning("Push failed: %s", push_status)
         except subprocess.CalledProcessError as exc:
             logger.exception("Commit failed")
             return ToolResult(name="local_fix", output={"error": f"Failed to commit changes: {exc.stderr}", "workspace": workspace_path, "branch": branch})
@@ -474,13 +544,13 @@ class Tooling:
                 "workspace": workspace_path,
                 "branch": branch,
                 "commit": commit_hash,
+                "push_status": push_status,
                 "files_changed": changed_files,
                 "applied": applied,
                 "skipped": skipped,
             },
         )
 
-        # --- ADDITIVE: Comment on PR with branch/commit after sonar fixes are requested ---
     async def comment_pr_with_branch(
         self,
         task: str,

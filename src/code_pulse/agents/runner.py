@@ -107,12 +107,34 @@ class Responder:
             answer = f"{answer}{separator}{branch_line}"
 
         logger.info("Model response %s", self._truncate(answer, 800))
-        # --- ADDITIVE: If fixes requested but local_fix reports none applied, append a truthful note ---
+        # --- ADDITIVE: If fixes requested but local_fix reports none applied or failed, append a truthful note with failure reasons ---
         try:
             wants_fix = ("fix" in task.lower()) or ("apply the changes" in task.lower()) or ("apply changes" in task.lower())
             if wants_fix and ("local_fix" in context):
+                failure_notes = []
                 if ("'applied': []" in context) or ("applied=0" in context) or ("'commit': None" in context):
-                    note = "Note: No automatic fixes were applied because a valid safe unified diff could not be generated; the branch may still exist for manual review."
+                    failure_notes.append(
+                        "Note: No automatic fixes were applied because a valid safe unified diff could not be generated; the branch may still exist for manual review."
+                    )
+                err_match = re.search(r"['\"]error['\"]:\s*['\"]([^'\"\n]+)", context)
+                if err_match:
+                    failure_notes.append(f"Local fix failed: {err_match.group(1)}")
+                else:
+                    reason_match = re.search(r"['\"]reason['\"]:\s*['\"]([^'\"\n]+)", context)
+                    if reason_match:
+                        failure_notes.append(f"Local fix skipped: {reason_match.group(1)}")
+                push_match = re.search(r"push_status['\"]:\s*['\"]([^'\"\n]+)", context)
+                if not push_match:
+                    push_match = re.search(r"'push_status':\s*([^,}]+)", context)
+                if push_match and "fail" in push_match.group(1).lower():
+                    failure_notes.append(f"Push status: {push_match.group(1).strip()}")
+
+                # include first skipped reason if present
+                skipped_match = re.search(r"'skipped':\s*\[\s*\{[^}]*'reason':\s*'([^']+)'", context)
+                if skipped_match:
+                    failure_notes.append(f"Skipped: {skipped_match.group(1)}")
+
+                for note in failure_notes:
                     if note not in answer:
                         answer = answer.rstrip() + "\n\n" + note
         except Exception:
@@ -250,6 +272,19 @@ class AgentRunner:
                     results.append(ToolResult(name="local_fix", output={"error": str(exc)}))
             else:
                 results.append(ToolResult(name="local_fix", output={"skipped": True, "reason": "Sonar tool did not run or returned no payload."}))
+
+        # Post-step: add PR comment with branch/commit + failures if any.
+        if wants_fix:
+            git_res = next((r for r in results if r.name == "git"), None)
+            local_fix_res = next((r for r in results if r.name == "local_fix"), None)
+            if git_res and local_fix_res:
+                try:
+                    pr_comment = await self.tooling.comment_pr_with_branch(task, git_res.output, local_fix_res.output)
+                    results.append(pr_comment)
+                    logger.info("PR comment result: %s", pr_comment.output)
+                except Exception as exc:
+                    logger.exception("PR comment failed")
+                    results.append(ToolResult(name="pr_comment", output={"error": str(exc)}))
 
         context_parts = []
         for res in results:
