@@ -24,7 +24,11 @@ class JiraClient(MCPClient):
         return self
 
     async def search(self, jql: str, max_results: int = 25) -> Dict[str, Any]:
-        return await self.get("/search", params={"jql": jql, "maxResults": max_results})
+        return await self.get(
+            "/search",
+            params={"jql": jql, "maxResults": max_results},
+            purpose="Search Jira issues using JQL",
+        )
 
     async def create_issue(
         self, project_key: str, summary: str, issue_type: str = "Task", description: str = ""
@@ -37,7 +41,11 @@ class JiraClient(MCPClient):
                 "issuetype": {"name": issue_type},
             }
         }
-        return await self.post("/issue", json=payload)
+        return await self.post(
+            "/issue",
+            json=payload,
+            purpose="Create Jira issue",
+        )
 
 
 def default_jira_client() -> JiraClient:

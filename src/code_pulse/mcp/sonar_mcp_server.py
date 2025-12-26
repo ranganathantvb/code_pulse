@@ -11,6 +11,7 @@ router = APIRouter(prefix="/sonar", tags=["sonar"])
 
 
 def _client(settings: Settings) -> SonarClient:
+    # Construct a SonarClient using configured base URL/token so handlers stay thin.
     return SonarClient(settings.sonar_base_url, settings.sonar_token, settings.sonar_organization)
 
 
@@ -27,6 +28,7 @@ async def fetch_rules(
     """Expose Sonar rules as JSON for downstream ingestion (e.g., RAG training)."""
     async with _client(settings) as client:
         try:
+            # Proxy the request to Sonar while allowing optional filters and pagination.
             return await client.rules(
                 query=query,
                 languages=languages,
@@ -36,8 +38,10 @@ async def fetch_rules(
                 page_size=page_size,
             )
         except ValueError as exc:
+            # Validation/404 conditions are converted to a client-friendly 400.
             raise HTTPException(status_code=400, detail=str(exc))
         except httpx.HTTPStatusError as exc:
+            # Preserve upstream status code to aid debugging Sonar connectivity/auth issues.
             detail = ""
             try:
                 detail = exc.response.text
@@ -45,5 +49,6 @@ async def fetch_rules(
                 detail = str(exc)
             raise HTTPException(status_code=exc.response.status_code, detail=detail)
         except Exception as exc:  # noqa: BLE001
+            # Catch-all to avoid leaking stack traces while logging server-side.
             logger.exception("Failed to fetch Sonar rules")
             raise HTTPException(status_code=502, detail=str(exc))

@@ -81,24 +81,24 @@
 # Fix SonarQube issues in PR https://github.com/ranganathantvb/ranganathantvb/pull/3 ?,
 
 
-When responding with summary, follow these formatting rules strictly:
-1. Use markdown format.
-2. Use "AI-Generated Summary:" as the main header.
-3. Write a concise summary in one paragraph under the header about total SonarQube issues found in the given PR. Do not list issues individually. Specify additional statistics for each issue category (type) and severity (numbers only, no details).
-4. When calculating totals, include both issues and security hotspots. For xample, if there are 3 BUG, 2 VULNERABILITY and 2 SECURITY_HOTSPOTs total number is 7.
-5. Write a single, concise sentence that clearly states the main changes while fixing issues in the PR related to SonarQube, generalizing across all issues found and fixed. Add it only if the fixes were made.
-6. Additionally, provide a link to the new branch created in the repository with proposed fixes.
+# When responding with summary, follow these formatting rules strictly:
+# 1. Use markdown format.
+# 2. Use "AI-Generated Summary:" as the main header.
+# 3. Write a concise summary in one paragraph under the header about total SonarQube issues found in the given PR. Do not list issues individually. Specify additional statistics for each issue category (type) and severity (numbers only, no details).
+# 4. When calculating totals, include both issues and security hotspots. For xample, if there are 3 BUG, 2 VULNERABILITY and 2 SECURITY_HOTSPOTs total number is 7.
+# 5. Write a single, concise sentence that clearly states the main changes while fixing issues in the PR related to SonarQube, generalizing across all issues found and fixed. Add it only if the fixes were made.
+# 6. Additionally, provide a link to the new branch created in the repository with proposed fixes.
 
-Summary output example is below (replace X, Y, Z... with actual numbers and <branch_link> with actual link): AI-Generated Summary: There were X SonarQube issues found in the provided PR, in the following categories:
-1. B BUG(s)
-2. V VULNERABILITY(ies)
-3. S CODE_SMELL(s)
-4. H SECURITY_HOTSPOT(s). The issues spanned various severity levels including:
-5. P BLOCKER(s)
-6. Q CRITICAL(s)
-7. R MAJOR(s)
-8. S MINOR(s)
-9. T INFO(s).
-10. K TO_REVIEW(s). 
+# Summary output example is below (replace X, Y, Z... with actual numbers and <branch_link> with actual link): AI-Generated Summary: There were X SonarQube issues found in the provided PR, in the following categories:
+# 1. B BUG(s)
+# 2. V VULNERABILITY(ies)
+# 3. S CODE_SMELL(s)
+# 4. H SECURITY_HOTSPOT(s). The issues spanned various severity levels including:
+# 5. P BLOCKER(s)
+# 6. Q CRITICAL(s)
+# 7. R MAJOR(s)
+# 8. S MINOR(s)
+# 9. T INFO(s).
+# 10. K TO_REVIEW(s). 
 
-The main goal of the PR is to resolve all identified SonarQube issues by implementing recommended fixes and best practices to enhance code quality. New branch with proposed fixes: pr-<PR_number>-ai-sonarqube-fixes
+# The main goal of the PR is to resolve all identified SonarQube issues by implementing recommended fixes and best practices to enhance code quality. New branch with proposed fixes: pr-<PR_number>-ai-sonarqube-fixes

@@ -18,6 +18,7 @@ class SonarMCPClient(MCPClient):
         page: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
+        """Call into the local MCP server to retrieve Sonar rule metadata."""
         params: Dict[str, Any] = {
             "page": page,
             "page_size": page_size,
@@ -31,4 +32,8 @@ class SonarMCPClient(MCPClient):
         if types:
             params["types"] = types
 
-        return await self.get("/sonar/rules", params=params)
+        return await self.get(
+            "/sonar/rules",
+            params=params,
+            purpose="Fetch cached Sonar rules via MCP",
+        )

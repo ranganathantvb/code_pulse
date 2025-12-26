@@ -25,17 +25,31 @@ class MCPClient:
         if self._client:
             await self._client.aclose()
 
-    async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get(self, path: str, params: Optional[Dict[str, Any]] = None, purpose: Optional[str] = None) -> Dict[str, Any]:
         assert self._client, "Client not initialized"
+        url = path if path.startswith("http") else f"{self.base_url}{path}"
+        if purpose:
+            logger.info("Starting GET %s purpose=%s params=%s", url, purpose, params)
+        else:
+            logger.info("Starting GET %s params=%s", url, params)
         response = await self._client.get(path, params=params)
         logger.info("GET %s params=%s status=%s", response.url, params, response.status_code)
         response.raise_for_status()
         return response.json()
 
     async def post(
-        self, path: str, data: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None
+        self,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+        purpose: Optional[str] = None,
     ) -> Dict[str, Any]:
         assert self._client, "Client not initialized"
+        url = path if path.startswith("http") else f"{self.base_url}{path}"
+        if purpose:
+            logger.info("Starting POST %s purpose=%s", url, purpose)
+        else:
+            logger.info("Starting POST %s", url)
         response = await self._client.post(path, data=data, json=json)
         logger.info("POST %s status=%s", response.url, response.status_code)
         response.raise_for_status()

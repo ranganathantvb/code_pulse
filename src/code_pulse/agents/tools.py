@@ -10,6 +10,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 # --- Unified diff helpers ---
+# Pull out diff segments from LLM output so downstream git apply checks make sense.
 def extract_unified_diff(text: str) -> str:
     """Extract unified diff from raw model output, respecting ```diff fences."""
     if not text:
@@ -24,6 +25,7 @@ def extract_unified_diff(text: str) -> str:
 
 
 def is_valid_unified_diff(diff_text: str) -> bool:
+    # Basic structural check so we do not attempt to apply malformed patches.
     return bool(diff_text and "--- " in diff_text and "+++ " in diff_text and "@@ " in diff_text)
 
 
@@ -48,8 +50,10 @@ class ToolResult:
 
 
 class Tooling:
+    # Orchestrates access to Git/Sonar/Jira plus local RAG.
     def __init__(self):
         self.settings: Settings = get_settings()
+        # Build concrete MCP clients once so tool calls can reuse connections/config.
         clients = client_factory(self.settings)
         self.git: GitClient = clients["git"]  # type: ignore[assignment]
         self.sonar: SonarClient = clients["sonar"]  # type: ignore[assignment]
@@ -57,6 +61,7 @@ class Tooling:
         self.rag = RAGService()
 
     def _parse_pull_url(self, url: str) -> Optional[Dict[str, str]]:
+        # Lightweight parser to avoid pulling in full URL libs.
         match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", url)
         if not match:
             return None
@@ -69,6 +74,8 @@ class Tooling:
         pull_number: Optional[int | str] = None,
         pull_url: Optional[str] = None,
     ) -> ToolResult:
+        # Allow callers to provide a PR URL instead of individual pieces.
+        # Logical switch: PR URL present -> decompose into owner/repo/number.
         if pull_url:
             parsed = self._parse_pull_url(pull_url)
             if parsed:
@@ -76,9 +83,11 @@ class Tooling:
                 repo = repo or parsed["repo"]
                 if pull_number is None:
                     pull_number = parsed["number"]
+        # Logical switch: require repository identifiers to continue.
         if not owner or not repo:
             raise ValueError("Git tool requires owner and repo")
 
+        # Collect repo metadata plus PR details/status/checks/files in one pass.
         async with self.git as client:
             repo_data = await client.repo(owner, repo)
             pulls = await client.pull_requests(owner, repo)
@@ -94,6 +103,7 @@ class Tooling:
                 files_count = len(pr_files)
                 changed_files = pr_data.get("changed_files")
                 head_sha = pr_data.get("head", {}).get("sha")
+                # Logical switch: only fetch status/checks when we know the head SHA.
                 if head_sha:
                     pr_status = await client.commit_status(owner, repo, head_sha)
                     pr_checks = await client.check_runs(owner, repo, head_sha)
@@ -137,7 +147,8 @@ class Tooling:
         issue_types: Optional[str] = None,
         hotspot_status: Optional[str] = None,
     ) -> ToolResult:
-        # Always try RAG for Sonar guidance.
+        # Sonar tool blends RAG guidance with live SonarQube/Cloud data when available.
+        # Always try RAG for Sonar guidance so we can respond even if live Sonar calls fail.
         rag_docs = self.rag.query(question or "sonar issue", namespace=namespace)
         rag_matches = [
             {"page_content": doc.page_content, "metadata": doc.metadata}
@@ -150,9 +161,11 @@ class Tooling:
         pr_issues = pr_hotspots = pr_quality_gate = None
         pr_issues_count = pr_hotspots_count = None
         projects = None
+        # Logical switch: only call Sonar APIs when we have a project target or search term.
         if project_key or project_search:
             async with self.sonar as client:
                 if project_key:
+                    # Baseline project data.
                     issues = await client.project_issues(project_key)
                     measures = await client.measures(project_key)
                     if pull_request is not None:
@@ -165,6 +178,7 @@ class Tooling:
                         except Exception as exc:  # noqa: BLE001
                             pr_issues = {"message": f"PR issues unavailable: {exc}"}
                         try:
+                            # Hotspots often require specific Sonar edition/permissions.
                             pr_hotspots = await client.pr_hotspots(
                                 project_key, pr_number, status=hotspot_status
                             )
@@ -172,10 +186,12 @@ class Tooling:
                         except Exception:  # noqa: BLE001
                             pr_hotspots = {"message": "Hotspots endpoint not available."}
                         try:
+                            # Quality gate gives the per-PR gate decision if configured.
                             pr_quality_gate = await client.pr_quality_gate(project_key, pr_number)
                         except Exception:  # noqa: BLE001
                             pr_quality_gate = {"message": "Quality gate endpoint not available."}
                 if project_search:
+                    # Optional search when only text query is provided.
                     projects = await client.projects(query=project_search)
 
         message = None
@@ -201,6 +217,7 @@ class Tooling:
     async def use_jira(
         self, jql: str, create: Optional[Dict[str, str]] = None
     ) -> ToolResult:
+        # Fetch issues by JQL and optionally create a new one in a single call.
         async with self.jira as client:
             search_results = await client.search(jql)
             created = None
@@ -214,6 +231,7 @@ class Tooling:
             return ToolResult(name="jira", output={"search": search_results, "created": created})
 
     def use_rag(self, question: str, namespace: str = "default") -> ToolResult:
+        # Thin wrapper around vector search so agents can retrieve snippets quickly.
         docs = self.rag.query(question, namespace=namespace)
         excerpts = [
             {"page_content": doc.page_content, "metadata": doc.metadata}
@@ -222,6 +240,7 @@ class Tooling:
         message = None if excerpts else "No relevant documents found."
         return ToolResult(name="rag", output={"matches": excerpts, "message": message})
 
+    # Heavyweight path: attempt to auto-apply Sonar fixes locally via LLM + git apply.
     async def fix_sonar_locally(
         self,
         task: str,
@@ -237,10 +256,12 @@ class Tooling:
         import tempfile
         from typing import List, Dict, Any, Optional, Tuple
 
+        # Run a subprocess while capturing output for logging.
         def _run_cmd(cmd: List[str], cwd: str, check: bool = True) -> subprocess.CompletedProcess:
             logger.info("CMD: %s (cwd=%s)", " ".join(cmd), cwd)
             return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
 
+        # Validate the workspace is a git repo (needed for apply/commit/push).
         def _is_git_repo(path: str) -> bool:
             try:
                 cp = _run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, check=True)
@@ -248,14 +269,17 @@ class Tooling:
             except Exception:
                 return False
 
+        # Extract explicit branch override from the task text if present.
         def _extract_branch_name(text: str) -> Optional[str]:
             m = re.search(r"\bbranch\b\s*[\"\']([^\"\']+)[\"\']", text, re.IGNORECASE)
             return m.group(1).strip() if m else None
 
+        # Guardrail: only proceed when caller asked for a fix.
         def _wants_fix(text: str) -> bool:
             t = text.lower()
             return ("fix" in t) or ("apply the changes" in t) or ("apply changes" in t)
 
+        # Map Sonar component keys to workspace-relative file paths.
         def _normalize_component_to_path(component: str, project_key: Optional[str] = None) -> str:
             if ":" in component:
                 return component.split(":", 1)[1]
@@ -282,6 +306,8 @@ class Tooling:
         logger.info("ENTER fix_sonar_locally task=%s", task)
 
         if not _wants_fix(task):
+            # Guardrail: only run heavy remediation flow when explicitly requested.
+            logger.info("Local fix skipped: task did not request fixes")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": "Task does not request fixes."})
 
         workspace_path = workspace_path or os.getenv("CODEPULSE_WORKSPACE_PATH")
@@ -308,6 +334,7 @@ class Tooling:
         issues: List[Dict[str, Any]] = pr_issues.get("issues") or []
         hotspots: List[Dict[str, Any]] = pr_hotspots.get("hotspots") or []
 
+        # Combine issues and hotspots into a single list of findings to remediate.
         findings: List[Dict[str, Any]] = []
         for iss in issues:
             findings.append({
@@ -329,6 +356,7 @@ class Tooling:
         logger.info("Findings total=%d (issues=%d, hotspots=%d)", len(findings), len(issues), len(hotspots))
 
         if not findings:
+            logger.info("Local fix skipped: Sonar payload contained no findings")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": "No Sonar findings available to fix.", "workspace": workspace_path, "branch": branch})
 
         # checkout/create/reset branch
@@ -440,6 +468,7 @@ class Tooling:
                 logger.info("Raw LLM response for rule %s: %s", rule, raw[:500].replace("\n", " "))
                 diff_text = extract_unified_diff(raw)
                 if not is_valid_unified_diff(diff_text):
+                    # Retry once with a stricter prompt when the model does not emit a clean patch.
                     retry_prompt = prompt + (
                         "\n\nIMPORTANT: Output ONLY a unified diff. Do NOT create new files. "
                         "Use headers exactly like '--- a/{path}' and '+++ b/{path}' and include '@@' hunk headers. No explanations."
@@ -459,6 +488,7 @@ class Tooling:
 
             new_file_target = _new_file_target(diff_text)
             if new_file_target:
+                # Guardrail: AI-generated files must be prefixed to avoid overwriting real code.
                 if not os.path.basename(new_file_target).startswith("AI_"):
                     logger.warning("Model diff attempts to create new file '%s' without AI_ prefix; skipping", new_file_target)
                     skipped.append({"file": new_file_target, "reason": "New files must use AI_ prefix"})
@@ -481,6 +511,7 @@ class Tooling:
                     text=True,
                 )
                 if chk.returncode != 0:
+                    # If a clean apply fails, try 3-way merge to improve robustness on stale contexts.
                     logger.warning("git apply --check failed for %s: %s", rel_path, chk.stderr or chk.stdout)
                     ap = subprocess.run(
                         ["git", "apply", "--3way", "--whitespace=nowarn", tf_path],
@@ -521,6 +552,7 @@ class Tooling:
         commit_hash = None
         push_status = None
         try:
+            # Only commit/push if there are actual changes staged by applied patches.
             status = _run_cmd(["git", "status", "--porcelain"], cwd=workspace_path, check=False).stdout.strip()
             if status:
                 _run_cmd(["git", "add", "-A"], cwd=workspace_path)
@@ -534,6 +566,8 @@ class Tooling:
                 except subprocess.CalledProcessError as exc:
                     push_status = f"push failed: {exc.stderr or exc.stdout}"
                     logger.warning("Push failed: %s", push_status)
+            else:
+                logger.info("No changes staged; skipping commit/push for branch '%s'", branch)
         except subprocess.CalledProcessError as exc:
             logger.exception("Commit failed")
             return ToolResult(name="local_fix", output={"error": f"Failed to commit changes: {exc.stderr}", "workspace": workspace_path, "branch": branch})
@@ -557,6 +591,7 @@ class Tooling:
         git_payload: Dict[str, Any],
         local_fix_payload: Dict[str, Any],
     ) -> ToolResult:
+        # Post results back to GitHub PR with branch/commit status when fixes requested.
         if not (
             ("fix" in task.lower())
             or ("apply the changes" in task.lower())

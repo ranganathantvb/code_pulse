@@ -143,3 +143,12 @@ set +a -->
 
 ## terminal 4
 # test using the curl
+
+<!-- 
+export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same string in GitHub webhook
+export GITHUB_TOKEN="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"                            # PAT to post PR comments
+export AGENT_API_URL="http://127.0.0.1:8000/agents/run"  # your agent endpoint
+export AGENT_API_KEY="super-secret-agent-key"            # used to protect /agents/run
+export AGENT_API_TIMEOUT=30                              # seconds to wait on the agent call from webhook
+export CODEPULSE_WORKSPACE_PATH="/Users/ranganathan/workspace/svc_catalog"
+export OLLAMA_HOST="http://localhost:11434"   # or OLLAMA_BASE_URL -->

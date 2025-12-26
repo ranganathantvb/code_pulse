@@ -15,6 +15,7 @@ def setup_logging(name: Optional[str] = None, level: int = logging.INFO) -> logg
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+        logger.propagate = False  # Avoid duplicate logs from root handlers.
     logger.setLevel(level)
     return logger
 

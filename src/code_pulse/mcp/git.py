@@ -23,13 +23,20 @@ class GitClient(MCPClient):
 
     async def repo(self, owner: str, repo: str) -> Dict[str, Any]:
         logger.info("Fetching repo owner=%s repo=%s", owner, repo)
-        return await self.get(f"/repos/{owner}/{repo}")
+        return await self.get(f"/repos/{owner}/{repo}", purpose="Fetch repository metadata")
 
     async def pull_requests(self, owner: str, repo: str, state: str = "open") -> List[Dict[str, Any]]:
-        return await self.get(f"/repos/{owner}/{repo}/pulls", params={"state": state})
+        return await self.get(
+            f"/repos/{owner}/{repo}/pulls",
+            params={"state": state},
+            purpose="List pull requests for repository",
+        )
 
     async def pull_request(self, owner: str, repo: str, number: int) -> Dict[str, Any]:
-        return await self.get(f"/repos/{owner}/{repo}/pulls/{number}")
+        return await self.get(
+            f"/repos/{owner}/{repo}/pulls/{number}",
+            purpose="Fetch pull request details",
+        )
 
     async def pull_request_files(
         self, owner: str, repo: str, number: int, per_page: int = 100
@@ -40,6 +47,7 @@ class GitClient(MCPClient):
             batch = await self.get(
                 f"/repos/{owner}/{repo}/pulls/{number}/files",
                 params={"page": page, "per_page": per_page},
+                purpose=f"Fetch pull request files page {page}",
             )
             files.extend(batch)
             if len(batch) < per_page:
@@ -48,10 +56,20 @@ class GitClient(MCPClient):
         return files
 
     async def commit_status(self, owner: str, repo: str, ref: str) -> Dict[str, Any]:
-        return await self.get(f"/repos/{owner}/{repo}/commits/{ref}/status")
+        return await self.get(
+            f"/repos/{owner}/{repo}/commits/{ref}/status",
+            purpose="Fetch combined status for commit ref",
+        )
 
     async def check_runs(self, owner: str, repo: str, ref: str) -> Dict[str, Any]:
-        return await self.get(f"/repos/{owner}/{repo}/commits/{ref}/check-runs")
+        return await self.get(
+            f"/repos/{owner}/{repo}/commits/{ref}/check-runs",
+            purpose="Fetch GitHub check runs for commit ref",
+        )
 
     async def commits(self, owner: str, repo: str, branch: str = "main") -> List[Dict[str, Any]]:
-        return await self.get(f"/repos/{owner}/{repo}/commits", params={"sha": branch})
+        return await self.get(
+            f"/repos/{owner}/{repo}/commits",
+            params={"sha": branch},
+            purpose="List commits for branch",
+        )

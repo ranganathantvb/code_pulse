@@ -18,6 +18,7 @@ logger = setup_logging(__name__)
 
 
 class Responder:
+    # Produces user-facing text responses based on tool output + prompts.
     def __init__(self):
         self.llm = None
 
@@ -64,12 +65,13 @@ class Responder:
         self.parser = StrOutputParser()
 
     def _truncate(self, value: str, limit: int = 500) -> str:
+        # Prevent noisy logs by trimming long task/context strings.
         if value is None:
             return ""
         return value if len(value) <= limit else f"{value[:limit]}... [truncated]"
 
     async def generate(self, task: str, context: str) -> str:
-        # Q&A tasks -> bullet points.
+        # Heuristic: switch to short bullet answers when task looks like a direct question.
         is_qa = any(re.search(p, task, re.IGNORECASE) for p in self._qa_patterns)
         if is_qa:
             task = task + "\n\nFormatting requirement: Answer each question as short bullet points. Do not output any code or scripts."
@@ -86,6 +88,7 @@ class Responder:
         else:
             answer = f"Task: {task}\nContext Summary:\n{context}"
 
+        # Logical switch: downstream formatting changes when the user wants fixes applied.
         wants_fix = ("fix" in task.lower()) or ("apply the changes" in task.lower()) or ("apply changes" in task.lower())
 
         # If a local_fix tool result exists, append deterministic branch/commit line.
@@ -102,6 +105,7 @@ class Responder:
 
         # Ensure branch link sentence is present only when user asked for fixes.
         branch_line = "A link to the new branch with proposed fixes can be found here."
+        # Logical switch: only append branch hint when fixes were requested.
         if wants_fix and branch_line not in answer:
             separator = "\n" if not answer.endswith("\n") else ""
             answer = f"{answer}{separator}{branch_line}"
@@ -110,6 +114,7 @@ class Responder:
         # --- ADDITIVE: If fixes requested but local_fix reports none applied or failed, append a truthful note with failure reasons ---
         try:
             wants_fix = ("fix" in task.lower()) or ("apply the changes" in task.lower()) or ("apply changes" in task.lower())
+            # Logical switch: only annotate failures when fix intent is present and local_fix ran.
             if wants_fix and ("local_fix" in context):
                 failure_notes = []
                 if ("'applied': []" in context) or ("applied=0" in context) or ("'commit': None" in context):
@@ -144,12 +149,14 @@ class Responder:
 
 
 class AgentRunner:
+    # Coordinates tool execution, memory, and response generation for a task.
     def __init__(self, responder: Optional[Responder] = None):
         self.tooling = Tooling()
         self.memory = MemoryStore()
         self.responder = responder or Responder()
 
     def _parse_task_repo(self, task: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        # Pull owner/repo/PR hints from free-form task text.
         pr_match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", task)
         if pr_match:
             return pr_match.group(1), pr_match.group(2), pr_match.group(3)
@@ -164,6 +171,7 @@ class AgentRunner:
         tools: List[str],
         tool_args: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Dict[str, Any]]:
+        # Auto-fill owner/repo/PR when the task text contains a GitHub URL or repo hint.
         owner, repo, pr_number = self._parse_task_repo(task)
         if "git" in tools:
             git_args = dict(tool_args.get("git", {}))
@@ -194,6 +202,7 @@ class AgentRunner:
     async def _execute_tools(
         self, tools: List[str], tool_args: Dict[str, Dict[str, Any]], namespace: str
     ) -> List[ToolResult]:
+        # Dispatch requested tools concurrently with their prepared arguments.
         tasks = []
         for name in tools:
             if name == "git" and "git" in tool_args:
@@ -242,14 +251,17 @@ class AgentRunner:
         namespace: str = "default",
         tool_args: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, object]:
+        # Main entry: orchestrate tool execution, optional fixes, and response formatting.
         logger.info("TASK RECEIVED: %s", task)
         logger.info("TOOLS REQUESTED (initial): %s", tools)
 
+        # Logical switch: fix intent implies we should include Sonar data even if not requested.
         wants_fix = ("fix" in task.lower()) or ("apply the changes" in task.lower()) or ("apply changes" in task.lower())
         if wants_fix and "sonar" not in tools:
             logger.info("Auto-injecting sonar tool for fix request")
             tools = list(tools) + ["sonar"]
-
+            
+        # To fill in owner/repo/PR or project keys inferred from the task text.
         tool_args = self._augment_tool_args(task, tools, tool_args or {})
         logger.info("TOOL ARGS (augmented): %s", {k: list(v.keys()) for k, v in tool_args.items()})
 
@@ -286,6 +298,7 @@ class AgentRunner:
                     logger.exception("PR comment failed")
                     results.append(ToolResult(name="pr_comment", output={"error": str(exc)}))
 
+        # Prepare deterministic context string fed to the responder.
         context_parts = []
         for res in results:
             context_parts.append(f"{res.name}: {res.output}")

@@ -185,10 +185,11 @@ async def github_webhook(
     raw_body = await request.body()
     logger.info("Webhook raw body %s", _truncate(raw_body, 1500))
 
-    # 1️⃣ Validate GitHub signature
+    # 1 Validate GitHub signature
+    logger.info("Validating GitHub signature")
     verify_github_signature(raw_body, x_hub_signature_256)
 
-    # 2️⃣ Read event
+    # 2️ Read event
     payload = await request.json()
     repo_full = payload.get("repository", {}).get("full_name")
     pr_number = payload.get("pull_request", {}).get("number")
@@ -208,11 +209,13 @@ async def github_webhook(
         repo = payload.get("repository", {})
 
         if action in ["opened", "synchronize", "reopened"]:
+            logger.info("Processing PR event", extra={"action": action, "repo": repo.get("full_name")})
             pr_number = pr.get("number")
             repo_full = repo.get("full_name")  # "ranganathantvb/svc_catalog"
             owner, name = repo_full.split("/")
 
-            # 3️⃣ Call your agent (Sonar scan + git)
+            # 3️ Call your agent (Sonar scan + git)
+            logger.info("Calling agent for PR", extra={"owner": owner, "repo": name, "pr": pr_number})
             agent_output = await call_agent(
                 f"Summarize Sonar issues and key risks for {owner}/{name}",
                 tools=["git", "sonar"],
@@ -225,7 +228,8 @@ async def github_webhook(
                 },
             )
 
-            # 4️⃣ Post comment back to PR
+            # 4️ Post comment back to PR
+            logger.info("Posting agent summary comment to PR", extra={"owner": owner, "repo": name, "pr": pr_number})
             await post_comment(owner, name, pr_number, _with_completion_footer(agent_output))
     elif x_github_event == "issue_comment":
         action = payload.get("action")
@@ -236,6 +240,7 @@ async def github_webhook(
         # Only respond when someone leaves a command like "/agent do something"
         command_text = _parse_agent_command(comment.get("body", ""))
         if action in {"created", "edited"} and command_text:
+            logger.info("Processing issue comment agent command", extra={"action": action})
             issue_number = issue.get("number")
             repo_full = repo.get("full_name", "")
             if not issue_number or "/" not in repo_full:
@@ -267,11 +272,13 @@ async def github_webhook(
                 git_args["pull_number"] = pr_number
                 sonar_args["pull_request"] = pr_number
 
+            logger.info("Calling agent for issue comment", extra={"owner": owner, "repo": name, "issue": issue_number, "pr": pr_number})
             agent_output = await call_agent(
                 command_text,
                 tools=["git", "sonar"],
                 tool_args={"git": git_args, "sonar": sonar_args},
             )
+            logger.info("Posting agent response to issue/PR", extra={"owner": owner, "repo": name, "issue": issue_number})
             await post_comment(owner, name, issue_number, _with_completion_footer(agent_output))
 
     response_payload = {"status": "ok"}
