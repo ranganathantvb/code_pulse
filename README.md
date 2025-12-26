@@ -18,6 +18,12 @@ cp .env.example .env  # fill tokens/URLs
 uvicorn code_pulse.app:app --reload
 ```
 
+## Run the API locally
+- Install deps and copy `.env.example` as above, then fill in Git/Sonar/Jira tokens and any optional RAG settings.
+- Start the API: `uvicorn code_pulse.app:app --host 0.0.0.0 --port 8000 --reload`
+- OpenAPI docs live at `http://localhost:8000/docs`; you can exercise endpoints from there.
+- Run tests with `pytest -q` once dependencies are installed.
+
 ### Local LLM (Ollama deepseek-coder)
 - Install Ollama and pull the model: `ollama pull deepseek-coder:6.7b`
 - (optional) set `OLLAMA_BASE_URL` or `OLLAMA_HOST` if not on the default `http://localhost:11434`
@@ -27,11 +33,13 @@ uvicorn code_pulse.app:app --reload
 - No bundled UI is included; the API is ready to be wired to a lightweight chat frontend (e.g., React/Vite or simple HTMX). You can start from the OpenAPI-powered `/docs` page to exercise endpoints, then point a UI at `/agents/run` for chat-style interactions.
 - Typical flow in a UI: maintain a `memory_key` per conversation, send user text as the `task`, set `tools` (e.g., `["git", "sonar", "rag"]`), and render the returned `answer` plus tool outputs.
 
-## API (high level)
-- `POST /ingest` upload files (multipart) with optional `namespace`
-- `POST /rag/query` ask questions with `question` and `namespace`
-- `POST /agents/run` run an agent with `task`, `tools` (git|sonar|jira|rag), `memory_key`, `namespace`
-- `GET /memory/{memory_key}` inspect stored messages
+## API endpoints
+- `GET /health` — liveness check, returns `{"status": "ok"}`.
+- `POST /ingest` — multipart file upload with optional `namespace` query param; returns chunked documents stored for RAG.
+- `POST /rag/query` — JSON `{"question": "...", "namespace": "..."}`; returns matching chunks (`content` + `metadata`).
+- `POST /agents/run` — JSON `{"task": "...", "tools": ["git","sonar","rag"], "memory_key": "session-id", "namespace": "default", "tool_args": {...}}`; returns agent answer and tool outputs.
+- `GET /memory/{memory_key}` — returns stored conversation messages; `limit` query param defaults to 50.
+- `GET /sonar/rules` — proxies SonarCloud rules with filters (`query`, `languages`, `severities`, `types`, `page`, `page_size`).
 
 ### Seed Sonar rules into RAG
 If you already have exported Sonar rule JSON (e.g., `.data/ingest/sonarr_rule_data.json`), you can index it for RAG answers:
@@ -111,6 +119,23 @@ Environment variables (see `.env.example`):
 - `JIRA_BASE_URL`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN`
 - `RAG_EMBEDDINGS_MODEL` (defaults to `sentence-transformers/all-MiniLM-L6-v2` via LangChain)
 - `DATA_DIR` (defaults to `.data`)
+- Webhook/agent relay: `GITHUB_WEBHOOK_SECRET` (required), `GIT_TOKEN` or `GITHUB_TOKEN` (to comment on PRs), `AGENT_API_URL` (defaults to `http://127.0.0.1:8000/agents/run`), `AGENT_API_KEY` (if you secure `/agents/run`), `AGENT_API_TIMEOUT` (seconds, defaults to 30).
+
+## GitHub webhook integration (PR + issue comments)
+- Webhook path: `/webhook-9d83cbbcf7f1`. Point GitHub to `http(s)://<host>:9000/webhook-9d83cbbcf7f1` with content type `application/json` and the same `GITHUB_WEBHOOK_SECRET`.
+- Subscribe to `Pull request` and `Issue comment` events:
+  - PR events (`opened`, `synchronize`, `reopened`) trigger the agent with `git` + `sonar` tools and post a summary comment back to the PR.
+  - Issue/PR comments containing `/agent <task>` trigger the agent with `git` + `sonar` (PR-aware when applicable) and post the response as a new comment.
+- Start the webhook relay (after exporting secrets/tokens):
+  ```bash
+  export GITHUB_WEBHOOK_SECRET="long-random-string"
+  export GITHUB_TOKEN="ghp_..."            # or GIT_TOKEN
+  export AGENT_API_URL="http://127.0.0.1:8000/agents/run"
+  export AGENT_API_KEY="super-secret-agent-key"  # only if /agents/run is secured
+  uvicorn code_pulse.webhook.webhook_server:app --host 0.0.0.0 --port 9000 --reload
+  ```
+- For public access during local dev, run `ngrok http 9000` (or similar) and use the forwarded URL plus the webhook path in GitHub settings.
+- The webhook server validates the GitHub signature (`X-Hub-Signature-256`) using `GITHUB_WEBHOOK_SECRET` before calling your agent API and posting PR/issue comments.
 
 ## Tests
 ```bash
@@ -122,33 +147,3 @@ pytest -q
 - Networked APIs are thin wrappers; enable/disable per deployment.
 - RAG artifacts and memory live under `.data` by default.
 - Extend agents or connectors by adding new tool classes in `code_pulse/agents/tools`.
-
-
-#### How to start 
-<!-- set -a          # auto-export all variables
-source .env
-set +a -->
-
-## terminal 1
- <!-- export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same as in GitHub webhook
- export GITHUB_TOKEN="your-github-pat"                # PAT with repo access
- export AGENT_API_KEY="6cf488ac11da5c73fdd4e170401accea13e77762d7659e65f6d4874c2478d4f8"  # optional
- uvicorn webhook_server:app --host 0.0.0.0 --port 9000 --reload -->
-
-## terminal 2
-# ngrok http 9000  
-
-## terminal 3
-# uvicorn code_pulse.app:app --reload    
-
-## terminal 4
-# test using the curl
-
-<!-- 
-export GITHUB_WEBHOOK_SECRET="e102965ec2f74fb5ca721fb0fe843004401b4d6df8254208b1f3c554117a5054"   # same string in GitHub webhook
-export GITHUB_TOKEN="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"                            # PAT to post PR comments
-export AGENT_API_URL="http://127.0.0.1:8000/agents/run"  # your agent endpoint
-export AGENT_API_KEY="super-secret-agent-key"            # used to protect /agents/run
-export AGENT_API_TIMEOUT=30                              # seconds to wait on the agent call from webhook
-export CODEPULSE_WORKSPACE_PATH="/Users/ranganathan/workspace/svc_catalog"
-export OLLAMA_HOST="http://localhost:11434"   # or OLLAMA_BASE_URL -->
