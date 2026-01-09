@@ -142,15 +142,52 @@ async def post_comment(owner: str, repo: str, pr_number: int, body: str):
     if not token:
         raise HTTPException(status_code=500, detail="GIT_TOKEN or GITHUB_TOKEN not set")
 
+    logger.info(
+        "Posting GitHub comment",
+        extra={
+            "owner": owner,
+            "repo": repo,
+            "issue_or_pr": pr_number,
+            "token_tail": token[-4:] if len(token) > 4 else "<short>",
+        },
+    )
+
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json"
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, json={"body": body})
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, headers=headers, json={"body": body})
+            resp.raise_for_status()
+            logger.info(
+                "GitHub comment posted",
+                extra={"status_code": resp.status_code, "url": str(resp.url)},
+            )
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        logger.error(
+            "GitHub API error status=%s url=%s body=%s req_id=%s",
+            response.status_code,
+            str(response.url),
+            _truncate(response.text, 400),
+            response.headers.get("x-github-request-id"),
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"GitHub API error {response.status_code}: "
+                f"{_truncate(response.text, 200)}"
+            ),
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Failed to call GitHub API url=%s error=%s", url, str(exc), exc_info=exc
+        )
+        raise HTTPException(status_code=502, detail=f"GitHub API request failed: {exc}") from exc
 
 
 def _parse_agent_command(body: str) -> str | None:
@@ -220,7 +257,12 @@ async def github_webhook(
                 f"Summarize Sonar issues and key risks for {owner}/{name}",
                 tools=["git", "sonar"],
                 tool_args={
-                    "git": {"owner": owner, "repo": name, "pull_number": pr_number},
+                    "git": {
+                        "owner": owner,
+                        "repo": name,
+                        "pull_number": pr_number,
+                        "post_summary_comment": True,
+                    },
                     "sonar": {
                         "project_key": _resolve_project_key(owner, name),
                         "pull_request": pr_number,
@@ -228,9 +270,11 @@ async def github_webhook(
                 },
             )
 
-            # 4️ Post comment back to PR
-            logger.info("Posting agent summary comment to PR", extra={"owner": owner, "repo": name, "pr": pr_number})
-            await post_comment(owner, name, pr_number, _with_completion_footer(agent_output))
+            # Summary comment is posted directly by the agent runner.
+            logger.info(
+                "Agent run completed; summary should be posted by agent",
+                extra={"owner": owner, "repo": name, "pr": pr_number},
+            )
     elif x_github_event == "issue_comment":
         action = payload.get("action")
         comment = payload.get("comment", {})
@@ -270,6 +314,7 @@ async def github_webhook(
             sonar_args: Dict[str, Any] = {"project_key": _resolve_project_key(owner, name)}
             if pr_number:
                 git_args["pull_number"] = pr_number
+                git_args["post_summary_comment"] = True
                 sonar_args["pull_request"] = pr_number
 
             logger.info("Calling agent for issue comment", extra={"owner": owner, "repo": name, "issue": issue_number, "pr": pr_number})
@@ -278,8 +323,14 @@ async def github_webhook(
                 tools=["git", "sonar"],
                 tool_args={"git": git_args, "sonar": sonar_args},
             )
-            logger.info("Posting agent response to issue/PR", extra={"owner": owner, "repo": name, "issue": issue_number})
-            await post_comment(owner, name, issue_number, _with_completion_footer(agent_output))
+            if pr_number:
+                logger.info(
+                    "Agent run completed for PR comment; summary should be posted by agent",
+                    extra={"owner": owner, "repo": name, "pr": pr_number},
+                )
+            else:
+                logger.info("Posting agent response to issue", extra={"owner": owner, "repo": name, "issue": issue_number})
+                await post_comment(owner, name, issue_number, _with_completion_footer(agent_output))
 
     response_payload = {"status": "ok"}
     logger.info("Webhook response %s", response_payload)

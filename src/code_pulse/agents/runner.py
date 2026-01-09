@@ -199,6 +199,14 @@ class AgentRunner:
                 tool_args["sonar"] = sonar_args
         return tool_args
 
+    def _should_comment_summary(self, tool_args: Dict[str, Dict[str, Any]]) -> bool:
+        # Prefer explicit request in tool_args, otherwise fall back to env (default on).
+        git_args = tool_args.get("git", {})
+        if "post_summary_comment" in git_args:
+            return bool(git_args.get("post_summary_comment"))
+        env_pref = os.getenv("CODEPULSE_POST_PR_SUMMARY", "true").lower()
+        return env_pref in {"1", "true", "yes", "on"}
+
     async def _execute_tools(
         self, tools: List[str], tool_args: Dict[str, Dict[str, Any]], namespace: str
     ) -> List[ToolResult]:
@@ -273,10 +281,15 @@ class AgentRunner:
         # Post-step: local autofix (non-breaking, runs only on fix/apply requests)
         if wants_fix:
             sonar_res = next((r for r in results if r.name == "sonar"), None)
+            git_res = next((r for r in results if r.name == "git"), None)
             logger.info("Local fix requested. Sonar result found=%s", sonar_res is not None)
             if sonar_res and isinstance(sonar_res.output, dict):
                 try:
-                    local_fix = await self.tooling.fix_sonar_locally(task, sonar_res.output)
+                    local_fix = await self.tooling.fix_sonar_locally(
+                        task,
+                        sonar_res.output,
+                        git_payload=git_res.output if git_res else None,
+                    )
                     results.append(local_fix)
                     logger.info("Local fix result: %s", local_fix.output)
                 except Exception as exc:
@@ -304,5 +317,21 @@ class AgentRunner:
             context_parts.append(f"{res.name}: {res.output}")
         context = "\n".join(context_parts) if context_parts else "No tools invoked."
         answer = await self.responder.generate(task, context)
+
+        # Post the generated summary back to the PR when requested/configured.
+        if self._should_comment_summary(tool_args):
+            git_res = next((r for r in results if r.name == "git"), None)
+            if git_res:
+                try:
+                    pr_summary_comment = await self.tooling.comment_pr_with_summary(
+                        git_res.output,
+                        answer,
+                    )
+                    results.append(pr_summary_comment)
+                    logger.info("PR summary comment result: %s", pr_summary_comment.output)
+                except Exception as exc:
+                    logger.exception("PR summary comment failed")
+                    results.append(ToolResult(name="pr_summary_comment", output={"error": str(exc)}))
+
         self.memory.append(memory_key, Message(role="assistant", content=answer))
         return {"answer": answer, "tools": [res.__dict__ for res in results], "memory_key": memory_key}

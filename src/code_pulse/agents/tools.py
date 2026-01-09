@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+import datetime
 import re
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,13 @@ def diff_creates_file(diff_text: str) -> bool:
     if not diff_text:
         return False
     return ("--- /dev/null" in diff_text) or ("new file mode" in diff_text)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
 from code_pulse.mcp.clients import client_factory
 from code_pulse.mcp.git import GitClient
 from code_pulse.mcp.sonar import SonarClient
@@ -240,11 +248,12 @@ class Tooling:
         message = None if excerpts else "No relevant documents found."
         return ToolResult(name="rag", output={"matches": excerpts, "message": message})
 
-    # Heavyweight path: attempt to auto-apply Sonar fixes locally via LLM + git apply.
+    # Heavyweight path: attempt to auto-apply Sonar fixes locally via LLM-generated edits.
     async def fix_sonar_locally(
         self,
         task: str,
         sonar_payload: Dict[str, Any],
+        git_payload: Optional[Dict[str, Any]] = None,
         workspace_path: Optional[str] = None,
     ) -> ToolResult:
         """
@@ -253,7 +262,6 @@ class Tooling:
         - Prefers minimal hotspot changes (validation/safe API/annotations) over refactors.
         """
         import subprocess
-        import tempfile
         from typing import List, Dict, Any, Optional, Tuple
 
         # Run a subprocess while capturing output for logging.
@@ -269,10 +277,77 @@ class Tooling:
             except Exception:
                 return False
 
+        def _normalize_workspace_path(path: str) -> str:
+            """
+            Resolve common path issues (missing leading slash on macOS-style paths, ~ expansion).
+            """
+            expanded = os.path.expanduser(path)
+            if expanded.startswith("Users/"):
+                expanded = f"/{expanded}"
+            return expanded
+
         # Extract explicit branch override from the task text if present.
         def _extract_branch_name(text: str) -> Optional[str]:
             m = re.search(r"\bbranch\b\s*[\"\']([^\"\']+)[\"\']", text, re.IGNORECASE)
             return m.group(1).strip() if m else None
+
+        def _generate_branch_from_prefix(prefix: str) -> str:
+            # Generate a unique branch name using prefix + timestamp to avoid collisions.
+            stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            return f"{prefix}_{stamp}"
+
+        def _next_incremental_branch(prefix: str, cwd: str) -> str:
+            """Find the next available incremental branch name with the given prefix."""
+            try:
+                existing = _run_cmd(["git", "branch", "--list", f"{prefix}_*"], cwd=cwd, check=False).stdout
+                numbers: List[int] = []
+                for line in existing.splitlines():
+                    m = re.search(rf"{re.escape(prefix)}_(\d+)", line.strip())
+                    if m:
+                        numbers.append(int(m.group(1)))
+                next_num = (max(numbers) + 1) if numbers else 1
+                return f"{prefix}_{next_num:02d}"
+            except Exception:
+                # Fallback to timestamp if listing fails.
+                return _generate_branch_from_prefix(prefix)
+
+        def _current_branch(cwd: str) -> Optional[str]:
+            try:
+                return _run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd).stdout.strip()
+            except Exception:
+                return None
+
+        def _resolve_branch(
+            task_text: str,
+            sonar_payload_in: Dict[str, Any],
+            git_payload_in: Optional[Dict[str, Any]],
+            cwd: str,
+        ) -> tuple[str, str]:
+            """
+            Pick a target branch in the following priority:
+            1) Explicitly mentioned in the task text (branch "<name>")
+            2) Provided in the Git payload (pull_request head ref) or Sonar payload (branch/git_branch keys)
+            3) Environment override (CODEPULSE_TARGET_BRANCH or CODEPULSE_GIT_BRANCH)
+            4) Branch prefix override (CODEPULSE_BRANCH_PREFIX -> incremental)
+            5) Fallback to incremental sonar_fix
+            """
+            pr = (git_payload_in or {}).get("pull_request") or {}
+            from_git = (pr.get("head") or {}).get("ref")
+            from_sonar = sonar_payload_in.get("branch") or sonar_payload_in.get("git_branch")
+            from_env = os.getenv("CODEPULSE_TARGET_BRANCH") or os.getenv("CODEPULSE_GIT_BRANCH")
+            explicit = _extract_branch_name(task_text)
+            if explicit:
+                return explicit, explicit
+
+            base_branch = from_git or from_sonar or from_env or _current_branch(cwd) or "main"
+
+            # If env provides a specific target branch, use it directly.
+            if from_env:
+                return base_branch, from_env
+
+            branch_prefix = os.getenv("CODEPULSE_BRANCH_PREFIX") or "fix_code_quality_issues"
+            target_branch = _next_incremental_branch(branch_prefix, cwd)
+            return base_branch, target_branch
 
         # Guardrail: only proceed when caller asked for a fix.
         def _wants_fix(text: str) -> bool:
@@ -297,6 +372,111 @@ class Tooling:
                 return new_file_match.group(1).strip()
             return None
 
+        def _target_path_from_diff(diff_text: str, default: str) -> str:
+            """Return target path from +++ header; fallback to provided path."""
+            if not diff_text:
+                return default
+            match = re.search(r"^\+\+\+\s+b/([^\n]+)", diff_text, flags=re.M)
+            if match:
+                return match.group(1).strip()
+            return default
+
+
+        def _parse_hunks(diff_text: str) -> List[Dict[str, Any]]:
+            """Lightweight unified diff parser for a single-file patch."""
+            hunks: List[Dict[str, Any]] = []
+            lines = diff_text.splitlines()
+            idx = 0
+            while idx < len(lines):
+                line = lines[idx]
+                if line.startswith("@@"):
+                    m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+                    if not m:
+                        raise ValueError(f"Malformed hunk header: {line}")
+                    orig_start = int(m.group(1))
+                    orig_count = int(m.group(2) or "1")
+                    new_start = int(m.group(3))
+                    new_count = int(m.group(4) or "1")
+                    idx += 1
+                    hunk_lines: List[Dict[str, str]] = []
+                    while idx < len(lines) and not lines[idx].startswith("@@"):
+                        marker = lines[idx][:1]
+                        text = lines[idx][1:] + "\n"
+                        if marker not in {" ", "+", "-"}:
+                            break
+                        hunk_lines.append({"type": marker, "text": text})
+                        idx += 1
+                    hunks.append(
+                        {
+                            "orig_start": orig_start,
+                            "orig_count": orig_count,
+                            "new_start": new_start,
+                            "new_count": new_count,
+                            "lines": hunk_lines,
+                        }
+                    )
+                else:
+                    idx += 1
+            return hunks
+
+        def _apply_hunks_to_file(diff_text: str, rel_path: str, base_path: str) -> str:
+            """Apply parsed hunks directly to the file without using git apply."""
+            target_rel = _target_path_from_diff(diff_text, rel_path)
+            abs_path = os.path.join(base_path, target_rel)
+            if not os.path.isfile(abs_path):
+                raise FileNotFoundError(f"File not found: {abs_path}")
+
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                orig_lines = fh.readlines()
+
+            hunks = _parse_hunks(diff_text)
+            if not hunks:
+                raise ValueError("No hunks found in diff")
+
+            new_lines: List[str] = []
+            cursor = 0
+
+            for hunk in hunks:
+                target_idx = hunk["orig_start"] - 1
+                if target_idx < cursor:
+                    raise ValueError("Overlapping hunks or invalid start")
+                new_lines.extend(orig_lines[cursor:target_idx])
+                pos = target_idx
+                for entry in hunk["lines"]:
+                    marker = entry["type"]
+                    text = entry["text"]
+                    if marker in {" ", "-"}:
+                        if pos >= len(orig_lines) or orig_lines[pos] != text:
+                            raise ValueError("Context mismatch when applying hunk")
+                    if marker == " ":
+                        new_lines.append(text)
+                        pos += 1
+                    elif marker == "-":
+                        pos += 1
+                    elif marker == "+":
+                        new_lines.append(text)
+                cursor = pos
+
+            new_lines.extend(orig_lines[cursor:])
+
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.writelines(new_lines)
+
+            return target_rel
+
+        def _save_failed_patch(diff_text: str, rel_path: str, base_path: str) -> Optional[str]:
+            """Persist a patch that failed to apply so the user can inspect it locally."""
+            if not diff_text:
+                return None
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel_path or "patch")
+            target_dir = os.path.join(base_path, ".codepulse", "patches")
+            os.makedirs(target_dir, exist_ok=True)
+            patch_path = os.path.join(target_dir, f"{safe_name}.patch")
+            with open(patch_path, "w", encoding="utf-8") as fh:
+                fh.write(diff_text)
+            logger.info("Patch for %s saved to %s", rel_path, patch_path)
+            return patch_path
+
         def _windowed_lines(content: str, start_line: int, radius: int = 60) -> Tuple[int, int, str]:
             lines = content.splitlines()
             start_idx = max(0, start_line - 1 - radius)
@@ -315,7 +495,7 @@ class Tooling:
             logger.error("CODEPULSE_WORKSPACE_PATH not set")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": "CODEPULSE_WORKSPACE_PATH not set."})
 
-        workspace_path = os.path.expanduser(workspace_path)
+        workspace_path = _normalize_workspace_path(workspace_path)
         logger.info("Workspace=%s", workspace_path)
 
         if not os.path.isdir(workspace_path):
@@ -326,8 +506,8 @@ class Tooling:
             logger.error("Workspace is not a git repository: %s", workspace_path)
             return ToolResult(name="local_fix", output={"skipped": True, "reason": f"Workspace is not a git repository: {workspace_path}"})
 
-        branch = _extract_branch_name(task) or "sonar_AI_fix"
-        logger.info("Target branch=%s", branch)
+        base_branch, branch = _resolve_branch(task, sonar_payload or {}, git_payload, workspace_path)
+        logger.info("Base branch=%s Target branch=%s", base_branch, branch)
 
         pr_issues = (sonar_payload or {}).get("pr_issues") or {}
         pr_hotspots = (sonar_payload or {}).get("pr_hotspots") or {}
@@ -362,9 +542,20 @@ class Tooling:
         # checkout/create/reset branch
         try:
             _run_cmd(["git", "fetch", "--all", "--prune"], cwd=workspace_path, check=False)
-            _run_cmd(["git", "checkout", "-B", branch], cwd=workspace_path)
+            _run_cmd(["git", "checkout", base_branch], cwd=workspace_path, check=False)
+            if base_branch != branch:
+                _run_cmd(["git", "checkout", "-B", branch, base_branch], cwd=workspace_path)
+            else:
+                _run_cmd(["git", "checkout", "-B", branch], cwd=workspace_path)
             current = _run_cmd(["git", "branch", "--show-current"], cwd=workspace_path, check=True).stdout.strip()
             logger.info("Current branch after checkout=%s", current)
+            if _bool_env("CODEPULSE_CLEAN_BRANCH_BEFORE_FIX"):
+                try:
+                    _run_cmd(["git", "reset", "--hard"], cwd=workspace_path)
+                    _run_cmd(["git", "clean", "-fd"], cwd=workspace_path)
+                    logger.info("Workspace cleaned before applying patches (CODEPULSE_CLEAN_BRANCH_BEFORE_FIX enabled).")
+                except subprocess.CalledProcessError as exc:
+                    logger.warning("Branch clean failed: %s", exc.stderr or exc.stdout)
         except subprocess.CalledProcessError as exc:
             logger.exception("Branch checkout failed")
             return ToolResult(name="local_fix", output={"error": f"Failed to create/checkout branch '{branch}': {exc.stderr}", "workspace": workspace_path, "branch": branch})
@@ -384,6 +575,7 @@ class Tooling:
         changed_files: List[str] = []
         applied: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
+        saved_patches: List[str] = []
 
         project_key = (sonar_payload or {}).get("project_key") or getattr(self.settings, "sonar_project_key", None)
 
@@ -422,11 +614,11 @@ class Tooling:
                 "3) Current code context (either the full file content or at minimum the exact method(s) and surrounding lines)\n\n"
                 "IMPORTANT CONSTRAINTS:\n"
                 "- Do NOT output a unified diff or patch in the narrative sections.\n"
-                "- Create fixes in new files prefixed with 'AI_' (e.g., AI_<OriginalName>.java) instead of modifying the original file directly unless a minimal wiring change is unavoidable.\n"
+                "- Modify the original file in place; do NOT create companion files.\n"
                 "- Prefer minimal changes that compile and preserve behavior.\n"
                 "- Avoid suppressions (NOSONAR / @SuppressWarnings) unless there is no safe alternative.\n"
                 "- Apply fixes for the actual rule intent; do not add unrelated validation unless it directly addresses the issue.\n"
-                "- Keep edits localized; if you must touch the original file, only add minimal glue to use the new AI_ file.\n\n"
+                "- Keep edits localized; avoid creating new files.\n\n"
                 "WORKFLOW YOU MUST FOLLOW:\n"
                 "A) Identify exactly where each Sonar issue occurs in the provided code context.\n"
                 "B) Choose the least risky remediation that satisfies the rule:\n"
@@ -441,7 +633,7 @@ class Tooling:
                 "   - Bullet list of issues to fix and chosen remediation per rule.\n"
                 "2) EDITS TO APPLY (LOCAL)\n"
                 "   For each file:\n"
-                "   - File path (use AI_ prefixed files for new code; minimal glue in originals only if required)\n"
+                "   - File path (modify existing file only; do not create new files)\n"
                 "   - “Before” snippet (only the relevant lines/method)\n"
                 "   - “After” snippet (only the updated lines/method)\n"
                 "   - Explanation of why this satisfies the rule\n"
@@ -459,7 +651,7 @@ class Tooling:
                 f"{window}\n\n"
                 "REPOSITORY ROOT PATH:\n"
                 f"{workspace_path}\n\n"
-                "After producing the PLAN/EDITS/COMMANDS/VALIDATION sections above, output ONLY the final unified diff (git-style) that applies cleanly with `git apply`, using headers --- a/<path> and +++ b/<path> with @@ hunks, and nothing else after the diff. For new files, ensure the path starts with AI_ and is placed alongside the original."
+                "After producing the PLAN/EDITS/COMMANDS/VALIDATION sections above, output ONLY the final unified diff (git-style) that applies cleanly with `git apply`, using headers --- a/<path> and +++ b/<path> with @@ hunks, and nothing else after the diff."
             )
             logger.info("Prompt sent to LLM for rule %s: %s", rule, prompt[:500].replace("\n", " "))
 
@@ -488,64 +680,30 @@ class Tooling:
 
             new_file_target = _new_file_target(diff_text)
             if new_file_target:
-                # Guardrail: AI-generated files must be prefixed to avoid overwriting real code.
-                if not os.path.basename(new_file_target).startswith("AI_"):
-                    logger.warning("Model diff attempts to create new file '%s' without AI_ prefix; skipping", new_file_target)
-                    skipped.append({"file": new_file_target, "reason": "New files must use AI_ prefix"})
-                    continue
+                # Guardrail: we don't want new companion files; only in-place edits are allowed.
+                logger.warning("Model diff attempts to create new file '%s'; skipping", new_file_target)
+                skipped.append({"file": new_file_target, "reason": "New files not allowed; modify original file in place"})
+                continue
             elif diff_creates_file(diff_text):
                 logger.warning("Model diff attempts to create a file for %s; skipping", rel_path)
                 skipped.append({"file": rel_path, "reason": "Model diff attempted to create a new file"})
                 continue
 
-            tf_path = None
             try:
-                with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
-                    tf.write(diff_text)
-                    tf_path = tf.name
-
-                chk = subprocess.run(
-                    ["git", "apply", "--check", "--whitespace=nowarn", tf_path],
-                    cwd=workspace_path,
-                    capture_output=True,
-                    text=True,
-                )
-                if chk.returncode != 0:
-                    # If a clean apply fails, try 3-way merge to improve robustness on stale contexts.
-                    logger.warning("git apply --check failed for %s: %s", rel_path, chk.stderr or chk.stdout)
-                    ap = subprocess.run(
-                        ["git", "apply", "--3way", "--whitespace=nowarn", tf_path],
-                        cwd=workspace_path,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if ap.returncode != 0:
-                        skipped.append({"file": rel_path, "reason": f"git apply failed: {ap.stderr or ap.stdout}"})
-                        continue
-                else:
-                    ap2 = subprocess.run(
-                        ["git", "apply", "--whitespace=nowarn", tf_path],
-                        cwd=workspace_path,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if ap2.returncode != 0:
-                        skipped.append({"file": rel_path, "reason": f"git apply failed: {ap2.stderr or ap2.stdout}"})
-                        continue
-
-                if rel_path not in changed_files:
-                    changed_files.append(rel_path)
-                applied.append({"file": rel_path, "rule": rule, "kind": f.get("kind")})
-                logger.info("✅ Change applied to file: '%s'\n- Rule: %s\n- Type: %s\n- Workspace: %s\n- Branch: %s\n- Patch Preview:\n%s", rel_path, rule, f.get("kind"), workspace_path, branch, diff_text[:500])
+                target_rel = _apply_hunks_to_file(diff_text, rel_path, workspace_path)
+                if target_rel not in changed_files:
+                    changed_files.append(target_rel)
+                applied.append({"file": target_rel, "rule": rule, "kind": f.get("kind")})
+                logger.info("✅ Change applied to file: '%s'\n- Rule: %s\n- Type: %s\n- Workspace: %s\n- Branch: %s\n- Patch Preview:\n%s", target_rel, rule, f.get("kind"), workspace_path, branch, diff_text[:500])
             except Exception as exc:
                 logger.warning("Patch apply failed for %s: %s", rel_path, exc)
-                skipped.append({"file": rel_path, "reason": f"Patch apply failed: {exc}"})
-            finally:
-                if tf_path:
-                    try:
-                        os.unlink(tf_path)
-                    except Exception:
-                        pass
+                patch_path = _save_failed_patch(diff_text, rel_path, workspace_path)
+                if patch_path:
+                    saved_patches.append(patch_path)
+                reason = f"Patch apply failed: {exc}"
+                if patch_path:
+                    reason = f"{reason} (patch saved to {patch_path})"
+                skipped.append({"file": rel_path, "reason": reason})
 
         logger.info("Summary of changes:\n- Total files changed: %d\n- Total fixes applied: %d\n- Total skipped: %d", len(changed_files), len(applied), len(skipped))
 
@@ -559,9 +717,19 @@ class Tooling:
                 _run_cmd(["git", "commit", "-m", "Fix Sonar issues (CodePulse)"], cwd=workspace_path)
                 commit_hash = _run_cmd(["git", "rev-parse", "HEAD"], cwd=workspace_path, check=True).stdout.strip()
                 logger.info("📝 All changes have been committed to branch '%s'.\n- Commit hash: %s", branch, commit_hash)
+                allow_force_push = _bool_env("CODEPULSE_FORCE_PUSH", False)
                 try:
                     push = _run_cmd(["git", "push", "-u", "origin", branch], cwd=workspace_path, check=False)
                     push_status = push.stdout.strip() or push.stderr.strip() or "pushed"
+                    push_ok = push.returncode == 0
+                    if not push_ok and allow_force_push:
+                        logger.info("Non-fast-forward push detected; retrying with force push as CODEPULSE_FORCE_PUSH is enabled.")
+                        try:
+                            push_force = _run_cmd(["git", "push", "-f", "origin", branch], cwd=workspace_path, check=False)
+                            push_status = push_force.stdout.strip() or push_force.stderr.strip() or "force pushed"
+                            push_ok = push_force.returncode == 0
+                        except subprocess.CalledProcessError as exc:
+                            push_status = f"force push failed: {exc.stderr or exc.stdout}"
                     logger.info("Push attempt result: %s", push_status)
                 except subprocess.CalledProcessError as exc:
                     push_status = f"push failed: {exc.stderr or exc.stdout}"
@@ -582,6 +750,7 @@ class Tooling:
                 "files_changed": changed_files,
                 "applied": applied,
                 "skipped": skipped,
+                "saved_patches": saved_patches,
             },
         )
 
@@ -602,7 +771,7 @@ class Tooling:
                 output={"skipped": True, "reason": "No fix requested"},
             )
 
-        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GIT_TOKEN")
         if not token:
             return ToolResult(
                 name="pr_comment",
@@ -661,5 +830,58 @@ class Tooling:
 
         return ToolResult(
             name="pr_comment",
+            output={"status": resp.status_code},
+        )
+
+    async def comment_pr_with_summary(
+        self,
+        git_payload: Dict[str, Any],
+        summary: str,
+    ) -> ToolResult:
+        # Post the generated summary back to the PR as a separate comment.
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GIT_TOKEN")
+        if not token:
+            return ToolResult(
+                name="pr_summary_comment",
+                output={"skipped": True, "reason": "GITHUB_TOKEN/GH_TOKEN/GIT_TOKEN not set"},
+            )
+
+        if not summary or not summary.strip():
+            return ToolResult(
+                name="pr_summary_comment",
+                output={"skipped": True, "reason": "Empty summary"},
+            )
+
+        pr = (git_payload or {}).get("pull_request") or {}
+        repo_obj = (git_payload or {}).get("repo") or {}
+        full_name = repo_obj.get("full_name")
+
+        if not full_name or "/" not in full_name:
+            return ToolResult(
+                name="pr_summary_comment",
+                output={"skipped": True, "reason": "Repo full_name missing"},
+            )
+
+        owner, repo = full_name.split("/", 1)
+        pull_number = pr.get("number") or git_payload.get("pull_number")
+
+        if not pull_number:
+            return ToolResult(
+                name="pr_summary_comment",
+                output={"skipped": True, "reason": "Pull number missing"},
+            )
+
+        body = f"CodePulse summary:\n\n{summary.strip()}"
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pull_number}/comments"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        logger.info("Posting summary PR comment to %s", url)
+        resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+
+        return ToolResult(
+            name="pr_summary_comment",
             output={"status": resp.status_code},
         )
