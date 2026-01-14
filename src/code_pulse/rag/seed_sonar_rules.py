@@ -9,7 +9,7 @@ logger = setup_logging(__name__)
 
 def main() -> None:
     rag = RAGService()
-    default_path = rag.data_dir.joinpath("ingest", "sonarr_rule_data.json")
+    default_path = rag.data_dir.joinpath("ingest", "sonar_rule_data.json")
     logger.info("Default Sonar rules path: %s", default_path)
 
     rules_path = Path(

@@ -42,7 +42,7 @@ uvicorn code_pulse.app:app --reload
 - `GET /sonar/rules` — proxies SonarCloud rules with filters (`query`, `languages`, `severities`, `types`, `page`, `page_size`).
 
 ### Seed Sonar rules into RAG
-If you already have exported Sonar rule JSON (e.g., `.data/ingest/sonarr_rule_data.json`), you can index it for RAG answers:
+If you already have exported Sonar rule JSON (e.g., `.data/ingest/sonar_rule_data.json`), you can index it for RAG answers:
 ```bash
 source .venv/bin/activate
 python -m code_pulse.rag.seed_sonar_rules  # accepts Enter for default path/namespace
@@ -51,7 +51,7 @@ This stores chunks under the `sonar` namespace by default. When invoking the age
 
 ## RAG how-to (setup, train, run, test)
 - **Install + env**: `python -m venv .venv && source .venv/bin/activate && pip install -e .`; copy `.env.example` to `.env` and fill tokens/URLs (Sonar/Git/Jira as needed).
-- **Train (ingest) Sonar rules**: place your rules export at `.data/ingest/sonarr_rule_data.json` (or another path), then run `python -m code_pulse.rag.seed_sonar_rules` and accept defaults (namespace `sonar`). Re-run this command whenever you refresh rules.
+- **Train (ingest) Sonar rules**: place your rules export at `.data/ingest/sonar_rule_data.json` (or another path), then run `python -m code_pulse.rag.seed_sonar_rules` and accept defaults (namespace `sonar`). Re-run this command whenever you refresh rules.
 - **Run API**: `uvicorn code_pulse.app:app --reload`; Swagger at `http://localhost:8000/docs`.
 - **Direct RAG query**: after seeding, call `POST /rag/query` with `{"question": "How to fix TLS 1.0 issues?", "namespace": "sonar"}`.
 - **Agent with Sonar RAG**: `POST /agents/run`:
@@ -119,6 +119,8 @@ Environment variables (see `.env.example`):
 - `JIRA_BASE_URL`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN`
 - `RAG_EMBEDDINGS_MODEL` (defaults to `sentence-transformers/all-MiniLM-L6-v2` via LangChain)
 - `DATA_DIR` (defaults to `.data`)
+- `CODEPULSE_FIX_MODEL` (defaults to `deepseek-coder:6.7b` for local remediation)
+- `CODEPULSE_FIX_MOCK_RESPONSE` (JSON payload used when `CODEPULSE_FIX_MODEL=mock`)
 - Webhook/agent relay: `GITHUB_WEBHOOK_SECRET` (required), `GIT_TOKEN` or `GITHUB_TOKEN` (to comment on PRs), `AGENT_API_URL` (defaults to `http://127.0.0.1:8000/agents/run`), `AGENT_API_KEY` (if you secure `/agents/run`), `AGENT_API_TIMEOUT` (seconds, defaults to 30).
 
 ## GitHub webhook integration (PR + issue comments)
@@ -143,8 +145,13 @@ pytest -q
 ```
 `tests/test_smoke.py` covers the API health check and memory round-trip. Add integration tests for RAG/agents once credentials and models are available.
 
+## Sonar self-check
+```bash
+python scripts/sonar_self_check.py
+```
+This ingests `.data/ingest/sonar_rule_data.json`, verifies rule-key lookup, and runs a mock local fix on a temporary repo.
+
 ## Notes
 - Networked APIs are thin wrappers; enable/disable per deployment.
 - RAG artifacts and memory live under `.data` by default.
 - Extend agents or connectors by adding new tool classes in `code_pulse/agents/tools`.
-

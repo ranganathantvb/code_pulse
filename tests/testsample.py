@@ -102,3 +102,23 @@
 # 10. K TO_REVIEW(s). 
 
 # The main goal of the PR is to resolve all identified SonarQube issues by implementing recommended fixes and best practices to enhance code quality. New branch with proposed fixes: pr-<PR_number>-ai-sonarqube-fixes
+
+
+#  ngrok http 9000  
+ export GITHUB_TOKEN=" <github_token>"                            # PAT to post PR comments
+ export AGENT_API_URL="http://127.0.0.1:8000/agents/run"  # your agent endpoint
+ export AGENT_API_KEY="super-secret-agent-key"            # used to protect agents run
+ export AGENT_API_TIMEOUT=30                              # seconds to wait on the agent call from webhook
+ export CODEPULSE_WORKSPACE_PATH="Users/ranganathan/workspace/svc_catalog"
+ export OLLAMA_HOST="http://localhost:11434"
+
+# uvicorn code_pulse.app:app --reload
+# CODEPULSE_WORKSPACE_PATH
+
+='java:S2119', namespace='sonar'
+2026-01-14 08:11:49,259 | INFO | code_pulse | RAG retrieved 0 chunk(s) for rule java:S2119
+2026-01-14 08:11:49,259 | INFO | code_pulse | RAG retrieval: rule_key='java:S2245', namespace='sonar'
+2026-01-14 08:11:49,262 | INFO | code_pulse | RAG retrieved 0 chunk(s) for rule java:S2245
+2026-01-14 08:11:49,262 | INFO | code_pulse | RAG retrieval: rule_key='java:S4790', namespace='sonar'
+2026-01-14 08:11:49,266 | INFO | code_pulse | RAG retrieved 0 chunk(s) for rule java:S4790
+2026-01-14 08:11:49,266 | INFO | code_pulse | Summary of changes:

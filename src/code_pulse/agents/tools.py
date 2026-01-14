@@ -1,40 +1,14 @@
-import os
-from dataclasses import dataclass
 import datetime
+import json
+import os
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
 
 # Avoid tokenizer fork warnings/deadlocks when forking LLM workers.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-
-# --- Unified diff helpers ---
-# Pull out diff segments from LLM output so downstream git apply checks make sense.
-def extract_unified_diff(text: str) -> str:
-    """Extract unified diff from raw model output, respecting ```diff fences."""
-    if not text:
-        return ""
-    fenced = re.search(r"```diff\s*(.*?)\s*```", text, flags=re.S | re.I)
-    if fenced:
-        return fenced.group(1).strip() + "\n"
-    plain = re.search(r"(^---\s+.*)", text, flags=re.S | re.M)
-    if plain:
-        return text[plain.start():].strip() + "\n"
-    return text.strip() + "\n"
-
-
-def is_valid_unified_diff(diff_text: str) -> bool:
-    # Basic structural check so we do not attempt to apply malformed patches.
-    return bool(diff_text and "--- " in diff_text and "+++ " in diff_text and "@@ " in diff_text)
-
-
-def diff_creates_file(diff_text: str) -> bool:
-    """Return True if diff attempts to create a new file (e.g., --- /dev/null)."""
-    if not diff_text:
-        return False
-    return ("--- /dev/null" in diff_text) or ("new file mode" in diff_text)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -286,16 +260,6 @@ class Tooling:
                 expanded = f"/{expanded}"
             return expanded
 
-        # Extract explicit branch override from the task text if present.
-        def _extract_branch_name(text: str) -> Optional[str]:
-            m = re.search(r"\bbranch\b\s*[\"\']([^\"\']+)[\"\']", text, re.IGNORECASE)
-            return m.group(1).strip() if m else None
-
-        def _generate_branch_from_prefix(prefix: str) -> str:
-            # Generate a unique branch name using prefix + timestamp to avoid collisions.
-            stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            return f"{prefix}_{stamp}"
-
         def _next_incremental_branch(prefix: str, cwd: str) -> str:
             """Find the next available incremental branch name with the given prefix."""
             try:
@@ -308,8 +272,8 @@ class Tooling:
                 next_num = (max(numbers) + 1) if numbers else 1
                 return f"{prefix}_{next_num:02d}"
             except Exception:
-                # Fallback to timestamp if listing fails.
-                return _generate_branch_from_prefix(prefix)
+                stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                return f"{prefix}_{stamp}"
 
         def _current_branch(cwd: str) -> Optional[str]:
             try:
@@ -325,28 +289,17 @@ class Tooling:
         ) -> tuple[str, str]:
             """
             Pick a target branch in the following priority:
-            1) Explicitly mentioned in the task text (branch "<name>")
-            2) Provided in the Git payload (pull_request head ref) or Sonar payload (branch/git_branch keys)
-            3) Environment override (CODEPULSE_TARGET_BRANCH or CODEPULSE_GIT_BRANCH)
-            4) Branch prefix override (CODEPULSE_BRANCH_PREFIX -> incremental)
-            5) Fallback to incremental sonar_fix
+            1) Provided in the Git payload (pull_request head ref) or Sonar payload (branch/git_branch keys)
+            2) Environment override (CODEPULSE_TARGET_BRANCH or CODEPULSE_GIT_BRANCH)
+            3) Current branch (git)
+            4) Fallback to main
             """
             pr = (git_payload_in or {}).get("pull_request") or {}
             from_git = (pr.get("head") or {}).get("ref")
             from_sonar = sonar_payload_in.get("branch") or sonar_payload_in.get("git_branch")
             from_env = os.getenv("CODEPULSE_TARGET_BRANCH") or os.getenv("CODEPULSE_GIT_BRANCH")
-            explicit = _extract_branch_name(task_text)
-            if explicit:
-                return explicit, explicit
-
             base_branch = from_git or from_sonar or from_env or _current_branch(cwd) or "main"
-
-            # If env provides a specific target branch, use it directly.
-            if from_env:
-                return base_branch, from_env
-
-            branch_prefix = os.getenv("CODEPULSE_BRANCH_PREFIX") or "fix_code_quality_issues"
-            target_branch = _next_incremental_branch(branch_prefix, cwd)
+            target_branch = _next_incremental_branch("Fix_sonar_issues", cwd)
             return base_branch, target_branch
 
         # Guardrail: only proceed when caller asked for a fix.
@@ -362,120 +315,44 @@ class Tooling:
                 return component[len(project_key):].lstrip("/\\")
             return component
 
-        def _new_file_target(diff_text: str) -> Optional[str]:
-            """Return target path if diff creates a new file (--- /dev/null to +++ b/path)."""
-            if not diff_text:
+        def _normalize_edit_path(raw_path: str, base_path: str) -> Optional[str]:
+            if not raw_path:
                 return None
-            new_file_match = re.search(r"^\+\+\+\s+b/([^\n]+)", diff_text, flags=re.M)
-            creates_file = re.search(r"^---\s+/dev/null", diff_text, flags=re.M)
-            if new_file_match and creates_file:
-                return new_file_match.group(1).strip()
-            return None
-
-        def _target_path_from_diff(diff_text: str, default: str) -> str:
-            """Return target path from +++ header; fallback to provided path."""
-            if not diff_text:
-                return default
-            match = re.search(r"^\+\+\+\s+b/([^\n]+)", diff_text, flags=re.M)
-            if match:
-                return match.group(1).strip()
-            return default
-
-
-        def _parse_hunks(diff_text: str) -> List[Dict[str, Any]]:
-            """Lightweight unified diff parser for a single-file patch."""
-            hunks: List[Dict[str, Any]] = []
-            lines = diff_text.splitlines()
-            idx = 0
-            while idx < len(lines):
-                line = lines[idx]
-                if line.startswith("@@"):
-                    m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-                    if not m:
-                        raise ValueError(f"Malformed hunk header: {line}")
-                    orig_start = int(m.group(1))
-                    orig_count = int(m.group(2) or "1")
-                    new_start = int(m.group(3))
-                    new_count = int(m.group(4) or "1")
-                    idx += 1
-                    hunk_lines: List[Dict[str, str]] = []
-                    while idx < len(lines) and not lines[idx].startswith("@@"):
-                        marker = lines[idx][:1]
-                        text = lines[idx][1:] + "\n"
-                        if marker not in {" ", "+", "-"}:
-                            break
-                        hunk_lines.append({"type": marker, "text": text})
-                        idx += 1
-                    hunks.append(
-                        {
-                            "orig_start": orig_start,
-                            "orig_count": orig_count,
-                            "new_start": new_start,
-                            "new_count": new_count,
-                            "lines": hunk_lines,
-                        }
-                    )
-                else:
-                    idx += 1
-            return hunks
-
-        def _apply_hunks_to_file(diff_text: str, rel_path: str, base_path: str) -> str:
-            """Apply parsed hunks directly to the file without using git apply."""
-            target_rel = _target_path_from_diff(diff_text, rel_path)
-            abs_path = os.path.join(base_path, target_rel)
-            if not os.path.isfile(abs_path):
-                raise FileNotFoundError(f"File not found: {abs_path}")
-
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                orig_lines = fh.readlines()
-
-            hunks = _parse_hunks(diff_text)
-            if not hunks:
-                raise ValueError("No hunks found in diff")
-
-            new_lines: List[str] = []
-            cursor = 0
-
-            for hunk in hunks:
-                target_idx = hunk["orig_start"] - 1
-                if target_idx < cursor:
-                    raise ValueError("Overlapping hunks or invalid start")
-                new_lines.extend(orig_lines[cursor:target_idx])
-                pos = target_idx
-                for entry in hunk["lines"]:
-                    marker = entry["type"]
-                    text = entry["text"]
-                    if marker in {" ", "-"}:
-                        if pos >= len(orig_lines) or orig_lines[pos] != text:
-                            raise ValueError("Context mismatch when applying hunk")
-                    if marker == " ":
-                        new_lines.append(text)
-                        pos += 1
-                    elif marker == "-":
-                        pos += 1
-                    elif marker == "+":
-                        new_lines.append(text)
-                cursor = pos
-
-            new_lines.extend(orig_lines[cursor:])
-
-            with open(abs_path, "w", encoding="utf-8") as fh:
-                fh.writelines(new_lines)
-
-            return target_rel
-
-        def _save_failed_patch(diff_text: str, rel_path: str, base_path: str) -> Optional[str]:
-            """Persist a patch that failed to apply so the user can inspect it locally."""
-            if not diff_text:
+            cleaned = raw_path.strip()
+            if cleaned.startswith(("a/", "b/")):
+                cleaned = cleaned[2:]
+            if os.path.isabs(cleaned):
+                try:
+                    cleaned = os.path.relpath(cleaned, base_path)
+                except ValueError:
+                    return None
+            if cleaned.startswith(".."):
                 return None
-            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel_path or "patch")
-            target_dir = os.path.join(base_path, ".codepulse", "patches")
-            os.makedirs(target_dir, exist_ok=True)
-            patch_path = os.path.join(target_dir, f"{safe_name}.patch")
-            with open(patch_path, "w", encoding="utf-8") as fh:
-                fh.write(diff_text)
-            logger.info("Patch for %s saved to %s", rel_path, patch_path)
-            return patch_path
+            return cleaned
+
+        def _contains_forbidden_markers(text: str) -> bool:
+            if not text:
+                return True
+            lowered = text.lower()
+            forbidden = ["```", "```diff", "--- a/", "+++ b/", "@@", "diff --git"]
+            return any(token in lowered for token in forbidden)
+
+        def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
+            if _contains_forbidden_markers(raw):
+                return None
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            if "edits" not in payload or not isinstance(payload.get("edits"), list):
+                return None
+            return payload
+
+        def _order_rule_chunks(chunks: List[Any]) -> List[Any]:
+            order = {"compliant": 0, "noncompliant": 1, "remediation": 2, "rationale": 3, "summary": 4}
+            return sorted(chunks, key=lambda doc: order.get(doc.metadata.get("section"), 99))
 
         def _windowed_lines(content: str, start_line: int, radius: int = 60) -> Tuple[int, int, str]:
             lines = content.splitlines()
@@ -537,7 +414,31 @@ class Tooling:
 
         if not findings:
             logger.info("Local fix skipped: Sonar payload contained no findings")
-            return ToolResult(name="local_fix", output={"skipped": True, "reason": "No Sonar findings available to fix.", "workspace": workspace_path, "branch": branch})
+            report_dir = os.path.join(workspace_path, ".codepulse", "reports")
+            os.makedirs(report_dir, exist_ok=True)
+            report_stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            report_path = os.path.join(report_dir, f"sonar_fix_report_{report_stamp}.json")
+            report_payload = {
+                "workspace": workspace_path,
+                "branch": branch,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "applied": [],
+                "skipped": [],
+                "entries": [{"status": "skipped", "reason": "No Sonar findings available to fix."}],
+            }
+            with open(report_path, "w", encoding="utf-8") as fh:
+                json.dump(report_payload, fh, indent=2)
+            return ToolResult(
+                name="local_fix",
+                output={
+                    "skipped": True,
+                    "reason": "No Sonar findings available to fix.",
+                    "workspace": workspace_path,
+                    "branch": branch,
+                    "report_path": report_path,
+                },
+            )
 
         # checkout/create/reset branch
         try:
@@ -553,7 +454,7 @@ class Tooling:
                 try:
                     _run_cmd(["git", "reset", "--hard"], cwd=workspace_path)
                     _run_cmd(["git", "clean", "-fd"], cwd=workspace_path)
-                    logger.info("Workspace cleaned before applying patches (CODEPULSE_CLEAN_BRANCH_BEFORE_FIX enabled).")
+                    logger.info("Workspace cleaned before applying edits (CODEPULSE_CLEAN_BRANCH_BEFORE_FIX enabled).")
                 except subprocess.CalledProcessError as exc:
                     logger.warning("Branch clean failed: %s", exc.stderr or exc.stdout)
         except subprocess.CalledProcessError as exc:
@@ -562,12 +463,25 @@ class Tooling:
 
         # LLM setup (Ollama)
         try:
-            from langchain_ollama import ChatOllama  # type: ignore
             from langchain_core.prompts import ChatPromptTemplate
             from langchain_core.output_parsers import StrOutputParser
+            from langchain_core.runnables import RunnableLambda
             base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
-            llm = ChatOllama(model="deepseek-coder:6.7b", temperature=0.1, base_url=base_url)
-            chain = ChatPromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
+            model_name = os.getenv("CODEPULSE_FIX_MODEL", "deepseek-coder:6.7b")
+            if model_name == "mock":
+                mock_response = os.getenv("CODEPULSE_FIX_MOCK_RESPONSE")
+                if not mock_response:
+                    raise ValueError("CODEPULSE_FIX_MOCK_RESPONSE is required for mock mode")
+
+                async def _mock_invoke(_: Dict[str, Any]) -> str:
+                    return mock_response
+
+                chain = RunnableLambda(_mock_invoke)
+            else:
+                from langchain_ollama import ChatOllama  # type: ignore
+
+                llm = ChatOllama(model=model_name, temperature=0.1, base_url=base_url)
+                chain = ChatPromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
         except Exception as exc:
             logger.exception("Ollama init failed")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": f"Ollama unavailable: {exc}", "workspace": workspace_path, "branch": branch})
@@ -575,7 +489,7 @@ class Tooling:
         changed_files: List[str] = []
         applied: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
-        saved_patches: List[str] = []
+        report_entries: List[Dict[str, Any]] = []
 
         project_key = (sonar_payload or {}).get("project_key") or getattr(self.settings, "sonar_project_key", None)
 
@@ -587,130 +501,278 @@ class Tooling:
             tr = f.get("textRange") or {}
             start_line = int(tr.get("startLine") or 1)
 
+            rule = f.get("rule") or f.get("ruleKey") or "SONAR_RULE"
             if not os.path.isfile(abs_path):
                 logger.warning("File not found: %s", abs_path)
-                skipped.append({"file": rel_path, "reason": "File not found in workspace"})
+                skipped.append({"file": rel_path, "rule": rule, "reason": "File not found in workspace"})
+                report_entries.append(
+                    {"rule": rule, "file": rel_path, "status": "skipped", "reason": "File not found in workspace"}
+                )
                 continue
 
             with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
             win_start, win_end, window = _windowed_lines(content, start_line=start_line, radius=60)
-
-            rule = f.get("rule") or "SONAR_RULE"
-            rag_query = f"How to fix Sonar rule {rule}"
-            logger.info("RAG retrieval: query='%s', namespace='sonar'", rag_query)
-            rag_docs = self.rag.query(rag_query, namespace="sonar")
-            rag_excerpt = "\n\n".join(d.page_content[:800] for d in rag_docs[:3])
+            logger.info("RAG retrieval: rule_key='%s', namespace='sonar'", rule)
+            rag_docs = self.rag.lookup_by_metadata(
+                namespace="sonar",
+                metadata_filter={"doc_type": "sonar_rule", "rule_key": rule},
+            )
             logger.info("RAG retrieved %d chunk(s) for rule %s", len(rag_docs), rule)
-            for idx, doc in enumerate(rag_docs[:3]):
+            if not rag_docs:
+                skipped.append({"file": rel_path, "rule": rule, "reason": "RAG_EMPTY_RULE"})
+                report_entries.append(
+                    {"rule": rule, "file": rel_path, "status": "skipped", "reason": "RAG_EMPTY_RULE"}
+                )
+                continue
+            ordered_chunks = _order_rule_chunks(list(rag_docs))
+            rag_excerpt = "\n\n".join(d.page_content for d in ordered_chunks)
+            for idx, doc in enumerate(ordered_chunks[:4]):
                 logger.info("RAG chunk %d for rule %s: %s", idx + 1, rule, doc.page_content[:300].replace("\n", " "))
 
             prompt = (
                 "You are a local code remediation agent running inside a developer workstation with read/write access to the repository.\n"
                 "Your goal is to fix the provided Sonar findings by editing files locally and validating the changes.\n\n"
-                "INPUTS YOU WILL RECEIVE:\n"
-                "1) Sonar Findings (rule, message, file path, and ideally the line range)\n"
-                "2) RAG Content (rule guidance and remediation patterns)\n"
-                "3) Current code context (either the full file content or at minimum the exact method(s) and surrounding lines)\n\n"
                 "IMPORTANT CONSTRAINTS:\n"
-                "- Do NOT output a unified diff or patch in the narrative sections.\n"
-                "- Modify the original file in place; do NOT create companion files.\n"
+                "- Output MUST be strict JSON only. No markdown, no code fences, no diff.\n"
+                "- Use only the provided RAG content and code context. Do not invent APIs or rules.\n"
+                "- Each edit must include a rag_quote copied verbatim from the provided RAG content.\n"
+                "- Modify the original file in place; do NOT create new files.\n"
                 "- Prefer minimal changes that compile and preserve behavior.\n"
-                "- Avoid suppressions (NOSONAR / @SuppressWarnings) unless there is no safe alternative.\n"
-                "- Apply fixes for the actual rule intent; do not add unrelated validation unless it directly addresses the issue.\n"
-                "- Keep edits localized; avoid creating new files.\n\n"
-                "WORKFLOW YOU MUST FOLLOW:\n"
-                "A) Identify exactly where each Sonar issue occurs in the provided code context.\n"
-                "B) Choose the least risky remediation that satisfies the rule:\n"
-                "   - java:S2119 “Save and re-use this Random”: avoid per-call new Random(); use ThreadLocalRandom OR reuse a static final Random if appropriate.\n"
-                "   - java:S2245 “Pseudorandom generator safety”: if used for security, use SecureRandom; if not security-sensitive, use ThreadLocalRandom and explicitly keep it non-security.\n"
-                "   - java:S4790 “Weak hash algorithm”: if used for passwords or security, replace with a stronger construct (bcrypt/PBKDF2/HMAC-SHA-256 depending on usage); if non-security integrity/dedup, prefer SHA-256.\n"
-                "C) Edit the file(s) locally using direct file writes (you can describe the edits explicitly).\n"
-                "D) Run local verification commands (compile/tests). If tests fail, fix and re-run.\n"
-                "E) Report exactly what you changed and why, mapping each change to a Sonar rule.\n\n"
-                "OUTPUT FORMAT (STRICT):\n"
-                "1) PLAN\n"
-                "   - Bullet list of issues to fix and chosen remediation per rule.\n"
-                "2) EDITS TO APPLY (LOCAL)\n"
-                "   For each file:\n"
-                "   - File path (modify existing file only; do not create new files)\n"
-                "   - “Before” snippet (only the relevant lines/method)\n"
-                "   - “After” snippet (only the updated lines/method)\n"
-                "   - Explanation of why this satisfies the rule\n"
-                "3) COMMANDS TO RUN\n"
-                "   - Commands to format (if applicable), compile, and test (e.g., mvn -q -DskipTests=false test)\n"
-                "4) VALIDATION RESULTS\n"
-                "   - State what would be checked (build/tests/sonar scan), and any expected side-effects.\n"
-                "   - If any uncertainty remains because code context is incomplete, state what additional context is needed (but still provide best-effort edits based on what was provided).\n\n"
-                "NOW FIX THESE FINDINGS USING THE RAG CONTENT BELOW AND THE PROVIDED CODE CONTEXT.\n\n"
-                "SONAR FINDINGS:\n"
+                "- Avoid suppressions (NOSONAR / @SuppressWarnings) unless there is no safe alternative.\n\n"
+                "OUTPUT JSON SCHEMA:\n"
+                "{\n"
+                "  \"rule\": \"java:S2119\",\n"
+                "  \"plan\": \"...\",\n"
+                "  \"edits\": [\n"
+                "    {\n"
+                "      \"file\": \"src/main/java/.../UserController.java\",\n"
+                "      \"before\": \"<exact substring from current file>\",\n"
+                "      \"after\": \"<replacement>\",\n"
+                "      \"rag_quote\": \"<verbatim quote from RAG content>\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"commands\": [\"mvn -q test\"],\n"
+                "  \"notes\": \"...\"\n"
+                "}\n\n"
+                "SONAR FINDING:\n"
                 f"- Kind: {f.get('kind')}\n- Rule: {rule}\n- Message: {f.get('message') or ''}\n- File: {rel_path}\n- Line: {start_line}\n\n"
-                "RAG CONTENT (RULE GUIDANCE):\n"
+                "RAG CONTENT (RULE GUIDANCE, USE VERBATIM QUOTES FROM THIS ONLY):\n"
                 f"{rag_excerpt}\n\n"
                 "CODE CONTEXT (CURRENT FILE CONTENT OR RELEVANT METHOD(S)):\n"
                 f"{window}\n\n"
                 "REPOSITORY ROOT PATH:\n"
                 f"{workspace_path}\n\n"
-                "After producing the PLAN/EDITS/COMMANDS/VALIDATION sections above, output ONLY the final unified diff (git-style) that applies cleanly with `git apply`, using headers --- a/<path> and +++ b/<path> with @@ hunks, and nothing else after the diff."
+                "Return ONLY the JSON object, no extra text."
             )
             logger.info("Prompt sent to LLM for rule %s: %s", rule, prompt[:500].replace("\n", " "))
 
             try:
                 raw = await chain.ainvoke({"prompt": prompt})
                 logger.info("Raw LLM response for rule %s: %s", rule, raw[:500].replace("\n", " "))
-                diff_text = extract_unified_diff(raw)
-                if not is_valid_unified_diff(diff_text):
-                    # Retry once with a stricter prompt when the model does not emit a clean patch.
-                    retry_prompt = prompt + (
-                        "\n\nIMPORTANT: Output ONLY a unified diff. Do NOT create new files. "
-                        "Use headers exactly like '--- a/{path}' and '+++ b/{path}' and include '@@' hunk headers. No explanations."
-                    )
+                payload = _parse_json_response(raw)
+                if payload is None:
+                    retry_prompt = prompt + "\n\nSTRICT JSON ONLY. No markdown, no diff, no extra text."
                     raw2 = await chain.ainvoke({"prompt": retry_prompt})
                     logger.info("Raw LLM retry response for rule %s: %s", rule, raw2[:500].replace("\n", " "))
-                    diff_text = extract_unified_diff(raw2)
+                    payload = _parse_json_response(raw2)
             except Exception as exc:
                 logger.exception("LLM invocation failed for %s", rel_path)
-                skipped.append({"file": rel_path, "reason": f"LLM failure: {exc}"})
+                skipped.append({"file": rel_path, "rule": rule, "reason": f"LLM failure: {exc}"})
+                report_entries.append(
+                    {"rule": rule, "file": rel_path, "status": "skipped", "reason": f"LLM failure: {exc}"}
+                )
                 continue
 
-            if not is_valid_unified_diff(diff_text):
-                logger.warning("Invalid diff from model for %s", rel_path)
-                skipped.append({"file": rel_path, "reason": "Model did not produce a valid unified diff"})
+            if payload is None:
+                logger.warning("Invalid JSON response from model for %s", rel_path)
+                skipped.append({"file": rel_path, "rule": rule, "reason": "MODEL_FORMAT_INVALID"})
+                report_entries.append(
+                    {"rule": rule, "file": rel_path, "status": "skipped", "reason": "MODEL_FORMAT_INVALID"}
+                )
                 continue
 
-            new_file_target = _new_file_target(diff_text)
-            if new_file_target:
-                # Guardrail: we don't want new companion files; only in-place edits are allowed.
-                logger.warning("Model diff attempts to create new file '%s'; skipping", new_file_target)
-                skipped.append({"file": new_file_target, "reason": "New files not allowed; modify original file in place"})
-                continue
-            elif diff_creates_file(diff_text):
-                logger.warning("Model diff attempts to create a file for %s; skipping", rel_path)
-                skipped.append({"file": rel_path, "reason": "Model diff attempted to create a new file"})
+            payload_rule = payload.get("rule") or rule
+            plan = payload.get("plan") or ""
+            edits = payload.get("edits") or []
+            if not edits:
+                skipped.append({"file": rel_path, "rule": rule, "reason": "MODEL_NO_EDITS"})
+                report_entries.append(
+                    {"rule": rule, "file": rel_path, "status": "skipped", "reason": "MODEL_NO_EDITS"}
+                )
                 continue
 
-            try:
-                target_rel = _apply_hunks_to_file(diff_text, rel_path, workspace_path)
-                if target_rel not in changed_files:
-                    changed_files.append(target_rel)
-                applied.append({"file": target_rel, "rule": rule, "kind": f.get("kind")})
-                logger.info("✅ Change applied to file: '%s'\n- Rule: %s\n- Type: %s\n- Workspace: %s\n- Branch: %s\n- Patch Preview:\n%s", target_rel, rule, f.get("kind"), workspace_path, branch, diff_text[:500])
-            except Exception as exc:
-                logger.warning("Patch apply failed for %s: %s", rel_path, exc)
-                patch_path = _save_failed_patch(diff_text, rel_path, workspace_path)
-                if patch_path:
-                    saved_patches.append(patch_path)
-                reason = f"Patch apply failed: {exc}"
-                if patch_path:
-                    reason = f"{reason} (patch saved to {patch_path})"
-                skipped.append({"file": rel_path, "reason": reason})
+            rule_texts = [doc.page_content for doc in ordered_chunks]
+            file_cache: Dict[str, str] = {}
+            for edit in edits:
+                edit_file = edit.get("file")
+                before = edit.get("before")
+                after = edit.get("after")
+                rag_quote = edit.get("rag_quote")
+                if not (edit_file and before and after and rag_quote):
+                    skipped.append({"file": rel_path, "rule": rule, "reason": "EDIT_FIELDS_MISSING"})
+                    report_entries.append(
+                        {"rule": rule, "file": rel_path, "status": "skipped", "reason": "EDIT_FIELDS_MISSING"}
+                    )
+                    continue
+                if not any(rag_quote in text for text in rule_texts):
+                    logger.warning(
+                        "RAG quote not found for rule %s file %s; quote_len=%d quote_head=%s",
+                        rule,
+                        edit_file,
+                        len(rag_quote),
+                        rag_quote[:200].replace("\n", " "),
+                    )
+
+                    def _normalize_quote(text: str) -> str:
+                        # Normalize whitespace/punctuation for tolerant matching.
+                        return re.sub(r"[^A-Za-z0-9]+", " ", text).strip().lower()
+
+                    def _first_sentence(text: str, limit: int = 240) -> str:
+                        if not text:
+                            return ""
+                        parts = re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)
+                        sentence = parts[0] if parts else text.strip()
+                        return sentence[:limit].strip()
+
+                    def _overlap_score(needle: str, haystack: str) -> int:
+                        needle_tokens = set(needle.split())
+                        haystack_tokens = set(haystack.split())
+                        if not needle_tokens or not haystack_tokens:
+                            return 0
+                        return len(needle_tokens & haystack_tokens)
+
+                    normalized_quote = _normalize_quote(rag_quote)
+                    normalized_hit = any(
+                        normalized_quote and normalized_quote in _normalize_quote(text)
+                        for text in rule_texts
+                    )
+                    logger.info(
+                        "RAG quote normalized_match=%s normalized_len=%d",
+                        normalized_hit,
+                        len(normalized_quote),
+                    )
+                    if not normalized_hit:
+                        best_text = ""
+                        best_score = 0
+                        for text in rule_texts:
+                            score = _overlap_score(normalized_quote, _normalize_quote(text))
+                            if score > best_score:
+                                best_score = score
+                                best_text = text
+                        if best_score > 0 and best_text:
+                            fallback_quote = _first_sentence(best_text)
+                            if fallback_quote:
+                                edit["rag_quote"] = fallback_quote
+                                rag_quote = fallback_quote
+                                logger.info(
+                                    "RAG quote replaced with fallback sentence for rule %s file %s score=%d",
+                                    rule,
+                                    edit_file,
+                                    best_score,
+                                )
+                                # Continue with fallback quote, do not skip.
+                            else:
+                                logger.warning(
+                                    "RAG fallback sentence empty for rule %s file %s",
+                                    rule,
+                                    edit_file,
+                                )
+                        if not edit.get("rag_quote"):
+                            for idx, text in enumerate(rule_texts[:4]):
+                                logger.info(
+                                    "RAG chunk %d len=%d head=%s",
+                                    idx + 1,
+                                    len(text),
+                                    text[:200].replace("\n", " "),
+                                )
+                            skipped.append({"file": edit_file, "rule": rule, "reason": "RAG_QUOTE_NOT_FOUND"})
+                            report_entries.append(
+                                {"rule": rule, "file": edit_file, "status": "skipped", "reason": "RAG_QUOTE_NOT_FOUND"}
+                            )
+                            continue
+                    else:
+                        logger.info(
+                            "RAG quote accepted after normalization for rule %s file %s",
+                            rule,
+                            edit_file,
+                        )
+
+                normalized = _normalize_edit_path(edit_file, workspace_path)
+                if not normalized:
+                    skipped.append({"file": edit_file, "rule": rule, "reason": "INVALID_EDIT_PATH"})
+                    report_entries.append(
+                        {"rule": rule, "file": edit_file, "status": "skipped", "reason": "INVALID_EDIT_PATH"}
+                    )
+                    continue
+                abs_target = os.path.join(workspace_path, normalized)
+                if not os.path.isfile(abs_target):
+                    skipped.append({"file": normalized, "rule": rule, "reason": "FILE_NOT_FOUND"})
+                    report_entries.append(
+                        {"rule": rule, "file": normalized, "status": "skipped", "reason": "FILE_NOT_FOUND"}
+                    )
+                    continue
+
+                content = file_cache.get(normalized)
+                if content is None:
+                    with open(abs_target, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                occurrences = content.count(before)
+                if occurrences == 0:
+                    skipped.append({"file": normalized, "rule": rule, "reason": "BEFORE_NOT_FOUND"})
+                    report_entries.append(
+                        {"rule": rule, "file": normalized, "status": "skipped", "reason": "BEFORE_NOT_FOUND"}
+                    )
+                    continue
+                if occurrences > 1:
+                    skipped.append({"file": normalized, "rule": rule, "reason": "BEFORE_NOT_UNIQUE"})
+                    report_entries.append(
+                        {"rule": rule, "file": normalized, "status": "skipped", "reason": "BEFORE_NOT_UNIQUE"}
+                    )
+                    continue
+
+                content = content.replace(before, after, 1)
+                file_cache[normalized] = content
+                with open(abs_target, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+
+                if normalized not in changed_files:
+                    changed_files.append(normalized)
+                applied.append({"file": normalized, "rule": payload_rule, "kind": f.get("kind"), "plan": plan})
+                report_entries.append(
+                    {"rule": payload_rule, "file": normalized, "status": "applied", "plan": plan}
+                )
+                logger.info(
+                    "✅ Change applied to file: '%s'\n- Rule: %s\n- Type: %s\n- Workspace: %s\n- Branch: %s",
+                    normalized,
+                    payload_rule,
+                    f.get("kind"),
+                    workspace_path,
+                    branch,
+                )
 
         logger.info("Summary of changes:\n- Total files changed: %d\n- Total fixes applied: %d\n- Total skipped: %d", len(changed_files), len(applied), len(skipped))
+
+        report_dir = os.path.join(workspace_path, ".codepulse", "reports")
+        os.makedirs(report_dir, exist_ok=True)
+        report_stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        report_path = os.path.join(report_dir, f"sonar_fix_report_{report_stamp}.json")
+        report_payload = {
+            "workspace": workspace_path,
+            "branch": branch,
+            "applied_count": len(applied),
+            "skipped_count": len(skipped),
+            "applied": applied,
+            "skipped": skipped,
+            "entries": report_entries,
+        }
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report_payload, fh, indent=2)
 
         commit_hash = None
         push_status = None
         try:
-            # Only commit/push if there are actual changes staged by applied patches.
+            # Only commit/push if there are actual changes staged by applied edits.
             status = _run_cmd(["git", "status", "--porcelain"], cwd=workspace_path, check=False).stdout.strip()
             if status:
                 _run_cmd(["git", "add", "-A"], cwd=workspace_path)
@@ -750,7 +812,7 @@ class Tooling:
                 "files_changed": changed_files,
                 "applied": applied,
                 "skipped": skipped,
-                "saved_patches": saved_patches,
+                "report_path": report_path,
             },
         )
 
@@ -769,13 +831,6 @@ class Tooling:
             return ToolResult(
                 name="pr_comment",
                 output={"skipped": True, "reason": "No fix requested"},
-            )
-
-        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GIT_TOKEN")
-        if not token:
-            return ToolResult(
-                name="pr_comment",
-                output={"skipped": True, "reason": "GITHUB_TOKEN/GH_TOKEN not set"},
             )
 
         pr = (git_payload or {}).get("pull_request") or {}
@@ -797,27 +852,57 @@ class Tooling:
                 output={"skipped": True, "reason": "Pull number missing"},
             )
 
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GIT_TOKEN")
         branch = (local_fix_payload or {}).get("branch")
         commit = (local_fix_payload or {}).get("commit")
         applied = (local_fix_payload or {}).get("applied") or []
         skipped = (local_fix_payload or {}).get("skipped") or []
+        report_path = (local_fix_payload or {}).get("report_path")
+        error = (local_fix_payload or {}).get("error")
 
         body_lines = ["CodePulse Sonar AutoFix update:"]
         if branch:
             body_lines.append(f"- Branch: `{branch}`")
         if commit:
             body_lines.append(f"- Commit: `{commit}`")
+            body_lines.append(f"- Branch link: https://github.com/{owner}/{repo}/tree/{branch}")
         else:
             body_lines.append("- Commit: none")
         body_lines.append(f"- Applied fixes: {len(applied)}")
         body_lines.append(f"- Skipped findings: {len(skipped)}")
+        if error:
+            body_lines.append(f"- Error: {error}")
+        if report_path:
+            body_lines.append(f"- Report: `{report_path}`")
+
+        if applied:
+            body_lines.append("")
+            body_lines.append("Applied summary:")
+            for item in applied[:10]:
+                rule = item.get("rule") or "unknown-rule"
+                file = item.get("file") or "unknown-file"
+                plan = item.get("plan") or "no plan"
+                body_lines.append(f"- {rule} | {file} | {plan}")
         if skipped:
             body_lines.append("")
             body_lines.append("Skipped reasons (first 3):")
             for s in skipped[:3]:
-                body_lines.append(f"- {s.get('file')}: {s.get('reason')}")
+                body_lines.append(f"- {s.get('rule') or 'unknown-rule'} | {s.get('file')}: {s.get('reason')}")
 
         body = "\n".join(body_lines)
+
+        if not token:
+            workspace = (local_fix_payload or {}).get("workspace") or os.getcwd()
+            report_dir = os.path.join(workspace, ".codepulse", "reports")
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(report_dir, f"pr_{pull_number}_comment.md")
+            with open(report_path, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+            logger.warning("GITHUB_TOKEN/GH_TOKEN missing; PR comment written to %s", report_path)
+            return ToolResult(
+                name="pr_comment",
+                output={"skipped": True, "reason": "GITHUB_TOKEN/GH_TOKEN not set", "report_path": report_path},
+            )
 
         url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pull_number}/comments"
         headers = {
@@ -827,6 +912,8 @@ class Tooling:
 
         logger.info("Posting PR comment to %s", url)
         resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+        if resp.status_code >= 400:
+            logger.warning("PR comment failed status=%s body=%s", resp.status_code, resp.text[:500])
 
         return ToolResult(
             name="pr_comment",
