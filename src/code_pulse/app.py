@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+import newrelic.agent
 from pydantic import BaseModel, Field
 
 from code_pulse.agents import AgentRunner
@@ -14,6 +15,9 @@ from code_pulse.mcp.sonar_mcp_server import router as sonar_router
 logger = setup_logging(__name__)
 
 app = FastAPI(title="Code Pulse", version="0.1.0")
+# Wrap the ASGI app so New Relic captures FastAPI requests as transactions
+app = newrelic.agent.ASGIApplicationWrapper(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
