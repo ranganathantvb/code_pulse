@@ -517,6 +517,7 @@ class Tooling:
             rag_docs = self.rag.lookup_by_metadata(
                 namespace="sonar",
                 metadata_filter={"doc_type": "sonar_rule", "rule_key": rule},
+                query_text=rule,
             )
             logger.info("RAG retrieved %d chunk(s) for rule %s", len(rag_docs), rule)
             if not rag_docs:
