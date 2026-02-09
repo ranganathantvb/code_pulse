@@ -33,6 +33,25 @@ AGENT_API_TIMEOUT = _get_float_env("AGENT_API_TIMEOUT", 30.0)
 WEBHOOK_PATH = "/webhook-9d83cbbcf7f1"  # random path to hide endpoint
 
 
+@app.on_event("startup")
+async def log_github_token_source() -> None:
+    git_token = os.getenv("GIT_TOKEN")
+    github_token = os.getenv("GITHUB_TOKEN")
+    token = git_token or github_token
+    source = "GIT_TOKEN" if git_token else ("GITHUB_TOKEN" if github_token else "<missing>")
+    if not token:
+        logger.warning("GitHub token not set (GIT_TOKEN or GITHUB_TOKEN)")
+        return
+    token_tail = token[-4:] if len(token) > 4 else "<short>"
+    has_whitespace = token != token.strip()
+    logger.info(
+        "GitHub token loaded source=%s token_tail=%s has_whitespace=%s",
+        source,
+        token_tail,
+        has_whitespace,
+    )
+
+
 def _truncate(value: bytes | str | None, limit: int = 1000) -> str:
     if value is None:
         return ""

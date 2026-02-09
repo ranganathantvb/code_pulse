@@ -21,6 +21,7 @@ from langchain_core.documents import Document
 
 from code_pulse.config import get_settings
 from code_pulse.logger import setup_logging
+from code_pulse import telemetry
 
 logger = setup_logging(__name__)
 
@@ -169,7 +170,22 @@ class RAGService:
 
     def _load_vectorstore(self, namespace: str) -> Optional[FAISS]:
         path = self._store_path(namespace)
-        if path.exists():
+        cache_hit = path.exists()
+        try:
+            telemetry.record_rag_cache_hit(cache_hit)
+        except Exception:
+            pass
+        if telemetry.cache_metrics_enabled():
+            try:
+                telemetry.log_cache_access(
+                    cache_name="rag_vectorstore",
+                    cache_hit=cache_hit,
+                    key_hash=telemetry.hash_key(namespace),
+                    request_id=telemetry.get_request_id(),
+                )
+            except Exception:
+                pass
+        if cache_hit:
             return FAISS.load_local(path, self._embeddings, allow_dangerous_deserialization=True)
         return None
 
@@ -393,6 +409,21 @@ class RAGService:
                 query_len=query_len,
             )
             _emit_rag_log(event)
+            try:
+                telemetry.record_rag_metrics(
+                    duration_ms=duration_ms,
+                    top_k=k,
+                    chunks_used=returned_count,
+                    cache_hit=None,
+                    query_len=query_len,
+                )
+            except Exception:
+                pass
+            if telemetry.perf_metrics_enabled():
+                try:
+                    telemetry.log_latency("rag_retrieval", duration_ms, request_id)
+                except Exception:
+                    pass
 
     def lookup_by_metadata(
         self,
@@ -484,3 +515,18 @@ class RAGService:
                 query_len=query_len,
             )
             _emit_rag_log(event)
+            try:
+                telemetry.record_rag_metrics(
+                    duration_ms=duration_ms,
+                    top_k=len(docs),
+                    chunks_used=returned_count,
+                    cache_hit=None,
+                    query_len=query_len,
+                )
+            except Exception:
+                pass
+            if telemetry.perf_metrics_enabled():
+                try:
+                    telemetry.log_latency("rag_retrieval", duration_ms, request_id)
+                except Exception:
+                    pass

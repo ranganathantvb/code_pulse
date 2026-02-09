@@ -2,6 +2,8 @@ import datetime
 import json
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +25,7 @@ from code_pulse.mcp.jira import JiraClient
 from code_pulse.rag.service import RAGService
 from code_pulse.config import get_settings, Settings
 from code_pulse.logger import logger
+from code_pulse import telemetry
 
 
 @dataclass
@@ -229,6 +232,7 @@ class Tooling:
         sonar_payload: Dict[str, Any],
         git_payload: Optional[Dict[str, Any]] = None,
         workspace_path: Optional[str] = None,
+        commit_mode: str = "single",
     ) -> ToolResult:
         """
         Attempt local Sonar remediations with guarded application + commit.
@@ -337,6 +341,49 @@ class Tooling:
             forbidden = ["```", "```diff", "--- a/", "+++ b/", "@@", "diff --git"]
             return any(token in lowered for token in forbidden)
 
+        def _normalize_whitespace(text: str) -> str:
+            return " ".join((text or "").split())
+
+        def _replace_once_with_flexible_whitespace(
+            content: str, before: str, after: str
+        ) -> Optional[str]:
+            normalized_before = _normalize_whitespace(before)
+            if not normalized_before:
+                return None
+            # First try an exact match for safety.
+            if before in content:
+                return content.replace(before, after, 1)
+            # Fallback: build a whitespace-flexible regex for the before text.
+            pattern = re.sub(r"\s+", r"\\s+", re.escape(before))
+            matches = list(re.finditer(pattern, content, flags=re.DOTALL))
+            if len(matches) != 1:
+                return None
+            return re.sub(pattern, after, content, count=1, flags=re.DOTALL)
+
+        def _replace_once_in_window(
+            content: str,
+            before: str,
+            after: str,
+            start_line: int,
+            end_line: int,
+        ) -> Optional[str]:
+            if start_line < 1 or end_line < start_line:
+                return None
+            lines = content.splitlines(keepends=True)
+            start_idx = max(0, start_line - 1)
+            end_idx = min(len(lines), end_line)
+            window_text = "".join(lines[start_idx:end_idx])
+            if before in window_text:
+                window_text = window_text.replace(before, after, 1)
+            else:
+                pattern = re.sub(r"\s+", r"\\s+", re.escape(before))
+                matches = list(re.finditer(pattern, window_text, flags=re.DOTALL))
+                if len(matches) != 1:
+                    return None
+                window_text = re.sub(pattern, after, window_text, count=1, flags=re.DOTALL)
+            lines[start_idx:end_idx] = [window_text]
+            return "".join(lines)
+
         def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
             if _contains_forbidden_markers(raw):
                 return None
@@ -354,22 +401,98 @@ class Tooling:
             order = {"compliant": 0, "noncompliant": 1, "remediation": 2, "rationale": 3, "summary": 4}
             return sorted(chunks, key=lambda doc: order.get(doc.metadata.get("section"), 99))
 
-        def _windowed_lines(content: str, start_line: int, radius: int = 60) -> Tuple[int, int, str]:
+        def _windowed_lines(content: str, start_line: int, radius: int = 120) -> Tuple[int, int, str]:
             lines = content.splitlines()
             start_idx = max(0, start_line - 1 - radius)
             end_idx = min(len(lines), start_line - 1 + radius)
             return start_idx + 1, end_idx, "\n".join(lines[start_idx:end_idx])
+
+        run_id = str(uuid.uuid4())
+        run_start = time.monotonic()
+        repo_name = None
+        if git_payload:
+            repo_obj = git_payload.get("repo") or {}
+            repo_name = repo_obj.get("full_name") or repo_obj.get("name")
+        telemetry.set_sonar_run_id(run_id)
+
+        def _duration_ms(start: float) -> int:
+            return max(0, int((time.monotonic() - start) * 1000))
+
+        def _emit_run(
+            status: str,
+            duration_ms: Optional[int] = None,
+            reason: Optional[str] = None,
+            branch_name: Optional[str] = None,
+            sonar_found: Optional[bool] = None,
+        ) -> None:
+            payload: Dict[str, Any] = {
+                "event": "sonar_fix_run",
+                "run_id": run_id,
+                "status": status,
+                "branch": branch_name,
+                "repo": repo_name,
+                "sonar_found": sonar_found,
+            }
+            if duration_ms is not None:
+                payload["duration_ms"] = duration_ms
+            if reason:
+                payload["reason"] = reason
+            telemetry.emit_structured_log(payload)
+
+        def _emit_item(
+            rule_key: str,
+            rule_type: str,
+            action: str,
+            reason: Optional[str] = None,
+            duration_ms: Optional[int] = None,
+            file_path: Optional[str] = None,
+        ) -> None:
+            payload: Dict[str, Any] = {
+                "event": "sonar_fix_item",
+                "run_id": run_id,
+                "rule_key": rule_key,
+                "rule_type": rule_type,
+                "action": action,
+                "file_path": file_path,
+            }
+            if duration_ms is not None:
+                payload["duration_ms"] = duration_ms
+            if reason:
+                payload["reason"] = reason
+            telemetry.emit_structured_log(payload)
+
+        def _emit_stage(
+            stage: str,
+            status: str,
+            duration_ms: Optional[int] = None,
+            reason: Optional[str] = None,
+        ) -> None:
+            payload: Dict[str, Any] = {
+                "event": "sonar_fix_stage",
+                "run_id": run_id,
+                "stage": stage,
+                "status": status,
+            }
+            if duration_ms is not None:
+                payload["duration_ms"] = duration_ms
+            if reason:
+                payload["reason"] = reason
+            telemetry.emit_structured_log(payload)
+
+        _emit_run(status="started")
 
         logger.info("ENTER fix_sonar_locally task=%s", task)
 
         if not _wants_fix(task):
             # Guardrail: only run heavy remediation flow when explicitly requested.
             logger.info("Local fix skipped: task did not request fixes")
+            _emit_run(status="skipped", reason="Task does not request fixes.")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": "Task does not request fixes."})
 
         workspace_path = workspace_path or os.getenv("CODEPULSE_WORKSPACE_PATH")
         if not workspace_path:
             logger.error("CODEPULSE_WORKSPACE_PATH not set")
+            _emit_run(status="skipped", reason="CODEPULSE_WORKSPACE_PATH not set.")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": "CODEPULSE_WORKSPACE_PATH not set."})
 
         workspace_path = _normalize_workspace_path(workspace_path)
@@ -377,14 +500,13 @@ class Tooling:
 
         if not os.path.isdir(workspace_path):
             logger.error("Workspace path does not exist: %s", workspace_path)
+            _emit_run(status="skipped", reason=f"Workspace path does not exist: {workspace_path}")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": f"Workspace path does not exist: {workspace_path}"})
 
         if not _is_git_repo(workspace_path):
             logger.error("Workspace is not a git repository: %s", workspace_path)
+            _emit_run(status="skipped", reason=f"Workspace is not a git repository: {workspace_path}")
             return ToolResult(name="local_fix", output={"skipped": True, "reason": f"Workspace is not a git repository: {workspace_path}"})
-
-        base_branch, branch = _resolve_branch(task, sonar_payload or {}, git_payload, workspace_path)
-        logger.info("Base branch=%s Target branch=%s", base_branch, branch)
 
         pr_issues = (sonar_payload or {}).get("pr_issues") or {}
         pr_hotspots = (sonar_payload or {}).get("pr_hotspots") or {}
@@ -400,6 +522,7 @@ class Tooling:
                 "message": iss.get("message"),
                 "component": iss.get("component"),
                 "textRange": iss.get("textRange") or {},
+                "issue_key": iss.get("key") or iss.get("issue") or iss.get("id"),
             })
         for hs in hotspots:
             findings.append({
@@ -408,11 +531,13 @@ class Tooling:
                 "message": hs.get("message"),
                 "component": hs.get("component") or hs.get("project"),
                 "textRange": hs.get("textRange") or {},
+                "issue_key": hs.get("key") or hs.get("hotspotKey") or hs.get("id"),
             })
 
         logger.info("Findings total=%d (issues=%d, hotspots=%d)", len(findings), len(issues), len(hotspots))
 
         if not findings:
+            branch = None
             logger.info("Local fix skipped: Sonar payload contained no findings")
             report_dir = os.path.join(workspace_path, ".codepulse", "reports")
             os.makedirs(report_dir, exist_ok=True)
@@ -429,16 +554,20 @@ class Tooling:
             }
             with open(report_path, "w", encoding="utf-8") as fh:
                 json.dump(report_payload, fh, indent=2)
+            _emit_run(status="skipped", reason="No Sonar findings available to fix.", branch_name=branch, sonar_found=False)
             return ToolResult(
                 name="local_fix",
                 output={
                     "skipped": True,
                     "reason": "No Sonar findings available to fix.",
                     "workspace": workspace_path,
-                    "branch": branch,
+                    "branch": None,
                     "report_path": report_path,
                 },
             )
+
+        base_branch, branch = _resolve_branch(task, sonar_payload or {}, git_payload, workspace_path)
+        logger.info("Base branch=%s Target branch=%s", base_branch, branch)
 
         # checkout/create/reset branch
         try:
@@ -459,6 +588,13 @@ class Tooling:
                     logger.warning("Branch clean failed: %s", exc.stderr or exc.stdout)
         except subprocess.CalledProcessError as exc:
             logger.exception("Branch checkout failed")
+            _emit_run(
+                status="failed",
+                reason=f"Failed to create/checkout branch '{branch}': {exc.stderr}",
+                duration_ms=_duration_ms(run_start),
+                branch_name=branch,
+                sonar_found=True,
+            )
             return ToolResult(name="local_fix", output={"error": f"Failed to create/checkout branch '{branch}': {exc.stderr}", "workspace": workspace_path, "branch": branch})
 
         # LLM setup (Ollama)
@@ -484,16 +620,30 @@ class Tooling:
                 chain = ChatPromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
         except Exception as exc:
             logger.exception("Ollama init failed")
+            _emit_run(
+                status="failed",
+                reason=f"Ollama unavailable: {exc}",
+                duration_ms=_duration_ms(run_start),
+                branch_name=branch,
+                sonar_found=True,
+            )
             return ToolResult(name="local_fix", output={"skipped": True, "reason": f"Ollama unavailable: {exc}", "workspace": workspace_path, "branch": branch})
 
         changed_files: List[str] = []
         applied: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         report_entries: List[Dict[str, Any]] = []
+        commits: List[str] = []
+        commit_errors: List[Dict[str, Any]] = []
 
         project_key = (sonar_payload or {}).get("project_key") or getattr(self.settings, "sonar_project_key", None)
+        commit_mode = (commit_mode or "single").strip().lower()
+        if commit_mode not in {"single", "per_issue"}:
+            logger.warning("Unknown commit_mode=%s; defaulting to single", commit_mode)
+            commit_mode = "single"
 
         for f in findings:
+            item_start = time.monotonic()
             component = str(f.get("component") or "")
             rel_path = _normalize_component_to_path(component, project_key=project_key)
             abs_path = os.path.join(workspace_path, rel_path)
@@ -508,17 +658,33 @@ class Tooling:
                 report_entries.append(
                     {"rule": rule, "file": rel_path, "status": "skipped", "reason": "File not found in workspace"}
                 )
+                _emit_item(
+                    rule_key=rule,
+                    rule_type=str(f.get("kind") or "unknown"),
+                    action="skipped",
+                    reason="File not found in workspace",
+                    duration_ms=_duration_ms(item_start),
+                    file_path=rel_path,
+                )
                 continue
 
             with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
             win_start, win_end, window = _windowed_lines(content, start_line=start_line, radius=60)
             logger.info("RAG retrieval: rule_key='%s', namespace='sonar'", rule)
+            rag_rule_key = rule
             rag_docs = self.rag.lookup_by_metadata(
                 namespace="sonar",
-                metadata_filter={"doc_type": "sonar_rule", "rule_key": rule},
+                metadata_filter={"doc_type": "sonar_rule", "rule_key": rag_rule_key},
                 query_text=rule,
             )
+            if not rag_docs and ":" not in rag_rule_key:
+                rag_rule_key = f"java:{rag_rule_key}"
+                rag_docs = self.rag.lookup_by_metadata(
+                    namespace="sonar",
+                    metadata_filter={"doc_type": "sonar_rule", "rule_key": rag_rule_key},
+                    query_text=rag_rule_key,
+                )
             logger.info("RAG retrieved %d chunk(s) for rule %s", len(rag_docs), rule)
             if not rag_docs:
                 skipped.append({"file": rel_path, "rule": rule, "reason": "RAG_EMPTY_RULE"})
@@ -569,12 +735,90 @@ class Tooling:
             logger.info("Prompt sent to LLM for rule %s: %s", rule, prompt[:500].replace("\n", " "))
 
             try:
-                raw = await chain.ainvoke({"prompt": prompt})
+                if telemetry.token_metrics_enabled():
+                    callback = telemetry.TokenUsageCallback()
+                    try:
+                        llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                        raw = await chain.ainvoke({"prompt": prompt}, config={"callbacks": [callback]})
+                    except Exception:
+                        llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                        raw = await chain.ainvoke({"prompt": prompt})
+                    if llm_start_ms is not None:
+                        try:
+                            telemetry.log_latency(
+                                "rag_llm",
+                                max(0, telemetry.monotonic_ms() - llm_start_ms),
+                                telemetry.get_request_id(),
+                            )
+                        except Exception:
+                            pass
+                    if callback.usage:
+                        try:
+                            telemetry.log_token_usage(
+                                model_name,
+                                callback.usage["prompt_tokens"],
+                                callback.usage["completion_tokens"],
+                                callback.usage["total_tokens"],
+                                telemetry.get_request_id(),
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                        raw = await chain.ainvoke({"prompt": prompt})
+                        if llm_start_ms is not None:
+                            try:
+                                telemetry.log_latency(
+                                    "rag_llm",
+                                    max(0, telemetry.monotonic_ms() - llm_start_ms),
+                                    telemetry.get_request_id(),
+                                )
+                            except Exception:
+                                pass
                 logger.info("Raw LLM response for rule %s: %s", rule, raw[:500].replace("\n", " "))
                 payload = _parse_json_response(raw)
                 if payload is None:
                     retry_prompt = prompt + "\n\nSTRICT JSON ONLY. No markdown, no diff, no extra text."
-                    raw2 = await chain.ainvoke({"prompt": retry_prompt})
+                    if telemetry.token_metrics_enabled():
+                        callback = telemetry.TokenUsageCallback()
+                        try:
+                            llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                            raw2 = await chain.ainvoke({"prompt": retry_prompt}, config={"callbacks": [callback]})
+                        except Exception:
+                            llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                            raw2 = await chain.ainvoke({"prompt": retry_prompt})
+                        if llm_start_ms is not None:
+                            try:
+                                telemetry.log_latency(
+                                    "rag_llm",
+                                    max(0, telemetry.monotonic_ms() - llm_start_ms),
+                                    telemetry.get_request_id(),
+                                )
+                            except Exception:
+                                pass
+                        if callback.usage:
+                            try:
+                                telemetry.log_token_usage(
+                                    model_name,
+                                    callback.usage["prompt_tokens"],
+                                    callback.usage["completion_tokens"],
+                                    callback.usage["total_tokens"],
+                                    telemetry.get_request_id(),
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        llm_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                        raw2 = await chain.ainvoke({"prompt": retry_prompt})
+                        if llm_start_ms is not None:
+                            try:
+                                telemetry.log_latency(
+                                    "rag_llm",
+                                    max(0, telemetry.monotonic_ms() - llm_start_ms),
+                                    telemetry.get_request_id(),
+                                )
+                            except Exception:
+                                pass
                     logger.info("Raw LLM retry response for rule %s: %s", rule, raw2[:500].replace("\n", " "))
                     payload = _parse_json_response(raw2)
             except Exception as exc:
@@ -583,6 +827,14 @@ class Tooling:
                 report_entries.append(
                     {"rule": rule, "file": rel_path, "status": "skipped", "reason": f"LLM failure: {exc}"}
                 )
+                _emit_item(
+                    rule_key=rule,
+                    rule_type=str(f.get("kind") or "unknown"),
+                    action="failed",
+                    reason=f"LLM failure: {exc}",
+                    duration_ms=_duration_ms(item_start),
+                    file_path=rel_path,
+                )
                 continue
 
             if payload is None:
@@ -590,6 +842,14 @@ class Tooling:
                 skipped.append({"file": rel_path, "rule": rule, "reason": "MODEL_FORMAT_INVALID"})
                 report_entries.append(
                     {"rule": rule, "file": rel_path, "status": "skipped", "reason": "MODEL_FORMAT_INVALID"}
+                )
+                _emit_item(
+                    rule_key=rule,
+                    rule_type=str(f.get("kind") or "unknown"),
+                    action="skipped",
+                    reason="MODEL_FORMAT_INVALID",
+                    duration_ms=_duration_ms(item_start),
+                    file_path=rel_path,
                 )
                 continue
 
@@ -601,10 +861,18 @@ class Tooling:
                 report_entries.append(
                     {"rule": rule, "file": rel_path, "status": "skipped", "reason": "MODEL_NO_EDITS"}
                 )
+                _emit_item(
+                    rule_key=rule,
+                    rule_type=str(f.get("kind") or "unknown"),
+                    action="skipped",
+                    reason="MODEL_NO_EDITS",
+                    duration_ms=_duration_ms(item_start),
+                    file_path=rel_path,
+                )
                 continue
 
             rule_texts = [doc.page_content for doc in ordered_chunks]
-            file_cache: Dict[str, str] = {}
+            applied_files_for_finding: List[str] = []
             for edit in edits:
                 edit_file = edit.get("file")
                 before = edit.get("before")
@@ -614,6 +882,14 @@ class Tooling:
                     skipped.append({"file": rel_path, "rule": rule, "reason": "EDIT_FIELDS_MISSING"})
                     report_entries.append(
                         {"rule": rule, "file": rel_path, "status": "skipped", "reason": "EDIT_FIELDS_MISSING"}
+                    )
+                    _emit_item(
+                        rule_key=rule,
+                        rule_type=str(f.get("kind") or "unknown"),
+                        action="skipped",
+                        reason="EDIT_FIELDS_MISSING",
+                        duration_ms=_duration_ms(item_start),
+                        file_path=rel_path,
                     )
                     continue
                 if not any(rag_quote in text for text in rule_texts):
@@ -691,6 +967,14 @@ class Tooling:
                             report_entries.append(
                                 {"rule": rule, "file": edit_file, "status": "skipped", "reason": "RAG_QUOTE_NOT_FOUND"}
                             )
+                            _emit_item(
+                                rule_key=rule,
+                                rule_type=str(f.get("kind") or "unknown"),
+                                action="skipped",
+                                reason="RAG_QUOTE_NOT_FOUND",
+                                duration_ms=_duration_ms(item_start),
+                                file_path=edit_file,
+                            )
                             continue
                     else:
                         logger.info(
@@ -705,6 +989,14 @@ class Tooling:
                     report_entries.append(
                         {"rule": rule, "file": edit_file, "status": "skipped", "reason": "INVALID_EDIT_PATH"}
                     )
+                    _emit_item(
+                        rule_key=rule,
+                        rule_type=str(f.get("kind") or "unknown"),
+                        action="skipped",
+                        reason="INVALID_EDIT_PATH",
+                        duration_ms=_duration_ms(item_start),
+                        file_path=edit_file,
+                    )
                     continue
                 abs_target = os.path.join(workspace_path, normalized)
                 if not os.path.isfile(abs_target):
@@ -712,17 +1004,43 @@ class Tooling:
                     report_entries.append(
                         {"rule": rule, "file": normalized, "status": "skipped", "reason": "FILE_NOT_FOUND"}
                     )
+                    _emit_item(
+                        rule_key=rule,
+                        rule_type=str(f.get("kind") or "unknown"),
+                        action="skipped",
+                        reason="FILE_NOT_FOUND",
+                        duration_ms=_duration_ms(item_start),
+                        file_path=normalized,
+                    )
                     continue
 
-                content = file_cache.get(normalized)
-                if content is None:
-                    with open(abs_target, "r", encoding="utf-8", errors="replace") as fh:
-                        content = fh.read()
+                with open(abs_target, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
                 occurrences = content.count(before)
+                if occurrences == 0:
+                    windowed_content = _replace_once_in_window(
+                        content, before, after, start_line=win_start, end_line=win_end
+                    )
+                    if windowed_content is not None:
+                        content = windowed_content
+                        occurrences = 1
+                if occurrences == 0:
+                    normalized_content = _replace_once_with_flexible_whitespace(content, before, after)
+                    if normalized_content is not None:
+                        content = normalized_content
+                        occurrences = 1
                 if occurrences == 0:
                     skipped.append({"file": normalized, "rule": rule, "reason": "BEFORE_NOT_FOUND"})
                     report_entries.append(
                         {"rule": rule, "file": normalized, "status": "skipped", "reason": "BEFORE_NOT_FOUND"}
+                    )
+                    _emit_item(
+                        rule_key=rule,
+                        rule_type=str(f.get("kind") or "unknown"),
+                        action="skipped",
+                        reason="BEFORE_NOT_FOUND",
+                        duration_ms=_duration_ms(item_start),
+                        file_path=normalized,
                     )
                     continue
                 if occurrences > 1:
@@ -730,15 +1048,24 @@ class Tooling:
                     report_entries.append(
                         {"rule": rule, "file": normalized, "status": "skipped", "reason": "BEFORE_NOT_UNIQUE"}
                     )
+                    _emit_item(
+                        rule_key=rule,
+                        rule_type=str(f.get("kind") or "unknown"),
+                        action="skipped",
+                        reason="BEFORE_NOT_UNIQUE",
+                        duration_ms=_duration_ms(item_start),
+                        file_path=normalized,
+                    )
                     continue
 
                 content = content.replace(before, after, 1)
-                file_cache[normalized] = content
                 with open(abs_target, "w", encoding="utf-8") as fh:
                     fh.write(content)
 
                 if normalized not in changed_files:
                     changed_files.append(normalized)
+                if normalized not in applied_files_for_finding:
+                    applied_files_for_finding.append(normalized)
                 applied.append({"file": normalized, "rule": payload_rule, "kind": f.get("kind"), "plan": plan})
                 report_entries.append(
                     {"rule": payload_rule, "file": normalized, "status": "applied", "plan": plan}
@@ -751,6 +1078,58 @@ class Tooling:
                     workspace_path,
                     branch,
                 )
+                _emit_item(
+                    rule_key=payload_rule,
+                    rule_type=str(f.get("kind") or "unknown"),
+                    action="applied",
+                    duration_ms=_duration_ms(item_start),
+                    file_path=normalized,
+                )
+
+            if commit_mode == "per_issue" and applied_files_for_finding:
+                try:
+                    status = _run_cmd(["git", "status", "--porcelain"], cwd=workspace_path, check=False).stdout.strip()
+                    if status:
+                        commit_start = time.monotonic()
+                        _run_cmd(["git", "add", "-A"], cwd=workspace_path)
+                        kind = str(f.get("kind") or "issue")
+                        primary_file = applied_files_for_finding[0]
+                        issue_key = f.get("issue_key")
+                        commit_msg = f"Fix {payload_rule} ({kind}): {primary_file} (CodePulse)"
+                        if issue_key:
+                            commit_msg = f"{commit_msg} [{issue_key}]"
+                        _run_cmd(["git", "commit", "-m", commit_msg], cwd=workspace_path)
+                        commit_hash = _run_cmd(["git", "rev-parse", "HEAD"], cwd=workspace_path, check=True).stdout.strip()
+                        commits.append(commit_hash)
+                        logger.info(
+                            "📝 Per-issue commit created: %s (rule=%s file=%s)",
+                            commit_hash,
+                            payload_rule,
+                            primary_file,
+                        )
+                        _emit_stage("commit", "success", duration_ms=_duration_ms(commit_start))
+                    else:
+                        logger.info(
+                            "Per-issue commit skipped; no changes after applying rule=%s file=%s",
+                            payload_rule,
+                            applied_files_for_finding[0],
+                        )
+                except subprocess.CalledProcessError as exc:
+                    logger.warning(
+                        "Per-issue commit failed for rule=%s file=%s: %s",
+                        payload_rule,
+                        applied_files_for_finding[0],
+                        exc.stderr or exc.stdout,
+                    )
+                    commit_errors.append(
+                        {
+                            "rule": payload_rule,
+                            "file": applied_files_for_finding[0],
+                            "reason": exc.stderr or exc.stdout or "commit failed",
+                        }
+                    )
+                    _emit_stage("commit", "failed", reason=exc.stderr or exc.stdout)
+                    continue
 
         logger.info("Summary of changes:\n- Total files changed: %d\n- Total fixes applied: %d\n- Total skipped: %d", len(changed_files), len(applied), len(skipped))
 
@@ -770,18 +1149,27 @@ class Tooling:
         with open(report_path, "w", encoding="utf-8") as fh:
             json.dump(report_payload, fh, indent=2)
 
-        commit_hash = None
+        commit_hash = commits[-1] if commits else None
         push_status = None
         try:
             # Only commit/push if there are actual changes staged by applied edits.
             status = _run_cmd(["git", "status", "--porcelain"], cwd=workspace_path, check=False).stdout.strip()
-            if status:
-                _run_cmd(["git", "add", "-A"], cwd=workspace_path)
-                _run_cmd(["git", "commit", "-m", "Fix Sonar issues (CodePulse)"], cwd=workspace_path)
-                commit_hash = _run_cmd(["git", "rev-parse", "HEAD"], cwd=workspace_path, check=True).stdout.strip()
-                logger.info("📝 All changes have been committed to branch '%s'.\n- Commit hash: %s", branch, commit_hash)
+            if commit_mode == "single":
+                if status:
+                    commit_start = time.monotonic()
+                    _run_cmd(["git", "add", "-A"], cwd=workspace_path)
+                    _run_cmd(["git", "commit", "-m", "Fix Sonar issues (CodePulse)"], cwd=workspace_path)
+                    commit_hash = _run_cmd(["git", "rev-parse", "HEAD"], cwd=workspace_path, check=True).stdout.strip()
+                    commits.append(commit_hash)
+                    logger.info("📝 All changes have been committed to branch '%s'.\n- Commit hash: %s", branch, commit_hash)
+                    _emit_stage("commit", "success", duration_ms=_duration_ms(commit_start))
+                else:
+                    logger.info("No changes staged; skipping commit for branch '%s'", branch)
+
+            if (commit_mode == "single" and commit_hash) or (commit_mode == "per_issue" and commits):
                 allow_force_push = _bool_env("CODEPULSE_FORCE_PUSH", False)
                 try:
+                    push_start = time.monotonic()
                     push = _run_cmd(["git", "push", "-u", "origin", branch], cwd=workspace_path, check=False)
                     push_status = push.stdout.strip() or push.stderr.strip() or "pushed"
                     push_ok = push.returncode == 0
@@ -794,25 +1182,48 @@ class Tooling:
                         except subprocess.CalledProcessError as exc:
                             push_status = f"force push failed: {exc.stderr or exc.stdout}"
                     logger.info("Push attempt result: %s", push_status)
+                    _emit_stage(
+                        "push",
+                        "success" if push_ok else "failed",
+                        duration_ms=_duration_ms(push_start),
+                        reason=None if push_ok else push_status,
+                    )
                 except subprocess.CalledProcessError as exc:
                     push_status = f"push failed: {exc.stderr or exc.stdout}"
                     logger.warning("Push failed: %s", push_status)
+                    _emit_stage("push", "failed", duration_ms=_duration_ms(push_start), reason=push_status)
             else:
-                logger.info("No changes staged; skipping commit/push for branch '%s'", branch)
+                logger.info("No changes staged; skipping push for branch '%s'", branch)
         except subprocess.CalledProcessError as exc:
             logger.exception("Commit failed")
+            _emit_stage("commit", "failed", reason=exc.stderr or exc.stdout)
+            _emit_run(
+                status="failed",
+                reason=f"Failed to commit changes: {exc.stderr}",
+                duration_ms=_duration_ms(run_start),
+                branch_name=branch,
+                sonar_found=True,
+            )
             return ToolResult(name="local_fix", output={"error": f"Failed to commit changes: {exc.stderr}", "workspace": workspace_path, "branch": branch})
 
+        _emit_run(
+            status="completed",
+            duration_ms=_duration_ms(run_start),
+            branch_name=branch,
+            sonar_found=True,
+        )
         return ToolResult(
             name="local_fix",
             output={
                 "workspace": workspace_path,
                 "branch": branch,
                 "commit": commit_hash,
+                "commits": commits,
                 "push_status": push_status,
                 "files_changed": changed_files,
                 "applied": applied,
                 "skipped": skipped,
+                "commit_errors": commit_errors,
                 "report_path": report_path,
             },
         )
@@ -824,11 +1235,29 @@ class Tooling:
         local_fix_payload: Dict[str, Any],
     ) -> ToolResult:
         # Post results back to GitHub PR with branch/commit status when fixes requested.
+        stage_start = time.monotonic()
+
+        def _emit_stage(status: str, reason: Optional[str] = None) -> None:
+            run_id = telemetry.get_sonar_run_id()
+            if not run_id:
+                return
+            payload = {
+                "event": "sonar_fix_stage",
+                "run_id": run_id,
+                "stage": "pr_comment",
+                "status": status,
+                "duration_ms": max(0, int((time.monotonic() - stage_start) * 1000)),
+            }
+            if reason:
+                payload["reason"] = reason
+            telemetry.emit_structured_log(payload)
+
         if not (
             ("fix" in task.lower())
             or ("apply the changes" in task.lower())
             or ("apply changes" in task.lower())
         ):
+            _emit_stage("failed", "No fix requested")
             return ToolResult(
                 name="pr_comment",
                 output={"skipped": True, "reason": "No fix requested"},
@@ -839,6 +1268,7 @@ class Tooling:
         full_name = repo_obj.get("full_name")
 
         if not full_name or "/" not in full_name:
+            _emit_stage("failed", "Repo full_name missing")
             return ToolResult(
                 name="pr_comment",
                 output={"skipped": True, "reason": "Repo full_name missing"},
@@ -848,6 +1278,7 @@ class Tooling:
         pull_number = pr.get("number") or git_payload.get("pull_number")
 
         if not pull_number:
+            _emit_stage("failed", "Pull number missing")
             return ToolResult(
                 name="pr_comment",
                 output={"skipped": True, "reason": "Pull number missing"},
@@ -857,7 +1288,8 @@ class Tooling:
         branch = (local_fix_payload or {}).get("branch")
         commit = (local_fix_payload or {}).get("commit")
         applied = (local_fix_payload or {}).get("applied") or []
-        skipped = (local_fix_payload or {}).get("skipped") or []
+        skipped_raw = (local_fix_payload or {}).get("skipped") or []
+        skipped = skipped_raw if isinstance(skipped_raw, list) else []
         report_path = (local_fix_payload or {}).get("report_path")
         error = (local_fix_payload or {}).get("error")
 
@@ -900,6 +1332,7 @@ class Tooling:
             with open(report_path, "w", encoding="utf-8") as fh:
                 fh.write(body + "\n")
             logger.warning("GITHUB_TOKEN/GH_TOKEN missing; PR comment written to %s", report_path)
+            _emit_stage("failed", "GITHUB_TOKEN/GH_TOKEN not set")
             return ToolResult(
                 name="pr_comment",
                 output={"skipped": True, "reason": "GITHUB_TOKEN/GH_TOKEN not set", "report_path": report_path},
@@ -915,6 +1348,9 @@ class Tooling:
         resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
         if resp.status_code >= 400:
             logger.warning("PR comment failed status=%s body=%s", resp.status_code, resp.text[:500])
+            _emit_stage("failed", f"status={resp.status_code}")
+        else:
+            _emit_stage("success")
 
         return ToolResult(
             name="pr_comment",
@@ -927,14 +1363,33 @@ class Tooling:
         summary: str,
     ) -> ToolResult:
         # Post the generated summary back to the PR as a separate comment.
+        stage_start = time.monotonic()
+
+        def _emit_stage(status: str, reason: Optional[str] = None) -> None:
+            run_id = telemetry.get_sonar_run_id()
+            if not run_id:
+                return
+            payload = {
+                "event": "sonar_fix_stage",
+                "run_id": run_id,
+                "stage": "pr_summary",
+                "status": status,
+                "duration_ms": max(0, int((time.monotonic() - stage_start) * 1000)),
+            }
+            if reason:
+                payload["reason"] = reason
+            telemetry.emit_structured_log(payload)
+
         token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GIT_TOKEN")
         if not token:
+            _emit_stage("failed", "GITHUB_TOKEN/GH_TOKEN/GIT_TOKEN not set")
             return ToolResult(
                 name="pr_summary_comment",
                 output={"skipped": True, "reason": "GITHUB_TOKEN/GH_TOKEN/GIT_TOKEN not set"},
             )
 
         if not summary or not summary.strip():
+            _emit_stage("failed", "Empty summary")
             return ToolResult(
                 name="pr_summary_comment",
                 output={"skipped": True, "reason": "Empty summary"},
@@ -945,6 +1400,7 @@ class Tooling:
         full_name = repo_obj.get("full_name")
 
         if not full_name or "/" not in full_name:
+            _emit_stage("failed", "Repo full_name missing")
             return ToolResult(
                 name="pr_summary_comment",
                 output={"skipped": True, "reason": "Repo full_name missing"},
@@ -954,6 +1410,7 @@ class Tooling:
         pull_number = pr.get("number") or git_payload.get("pull_number")
 
         if not pull_number:
+            _emit_stage("failed", "Pull number missing")
             return ToolResult(
                 name="pr_summary_comment",
                 output={"skipped": True, "reason": "Pull number missing"},
@@ -968,6 +1425,10 @@ class Tooling:
 
         logger.info("Posting summary PR comment to %s", url)
         resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+        if resp.status_code >= 400:
+            _emit_stage("failed", f"status={resp.status_code}")
+        else:
+            _emit_stage("success")
 
         return ToolResult(
             name="pr_summary_comment",

@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from code_pulse.agents.tools import Tooling, ToolResult
 from code_pulse.logger import setup_logging
 from code_pulse.memory import MemoryStore, Message
+from code_pulse import telemetry
 
 logger = setup_logging(__name__)
 
@@ -84,7 +85,26 @@ class Responder:
 
         if self.llm:
             chain = self.prompt | self.llm | self.parser
-            answer = await chain.ainvoke({"task": task, "context": context})
+            if telemetry.token_metrics_enabled():
+                callback = telemetry.TokenUsageCallback()
+                answer = await chain.ainvoke(
+                    {"task": task, "context": context},
+                    config={"callbacks": [callback]},
+                )
+                if callback.usage:
+                    try:
+                        model_name = callback.model_name or getattr(self.llm, "model", None) or "unknown"
+                        telemetry.log_token_usage(
+                            model_name,
+                            callback.usage["prompt_tokens"],
+                            callback.usage["completion_tokens"],
+                            callback.usage["total_tokens"],
+                            telemetry.get_request_id(),
+                        )
+                    except Exception:
+                        pass
+            else:
+                answer = await chain.ainvoke({"task": task, "context": context})
         else:
             answer = f"Task: {task}\nContext Summary:\n{context}"
 
@@ -212,15 +232,31 @@ class AgentRunner:
     ) -> List[ToolResult]:
         # Dispatch requested tools concurrently with their prepared arguments.
         tasks = []
+
+        async def _run_with_queue_wait(name: str, coro, enqueue_ms: int):
+            if telemetry.perf_metrics_enabled():
+                try:
+                    start_ms = telemetry.monotonic_ms()
+                    queue_wait_ms = max(0, start_ms - enqueue_ms)
+                    telemetry.log_queue_wait(name, queue_wait_ms, telemetry.get_request_id())
+                except Exception:
+                    pass
+            return await coro
+
         for name in tools:
+            enqueue_ms = telemetry.monotonic_ms()
             if name == "git" and "git" in tool_args:
                 args = tool_args["git"]
                 tasks.append(
-                    self.tooling.use_git(
-                        args.get("owner"),
-                        args.get("repo"),
-                        pull_number=args.get("pull_number"),
-                        pull_url=args.get("pull_url"),
+                    _run_with_queue_wait(
+                        "git",
+                        self.tooling.use_git(
+                            args.get("owner"),
+                            args.get("repo"),
+                            pull_number=args.get("pull_number"),
+                            pull_url=args.get("pull_url"),
+                        ),
+                        enqueue_ms,
                     )
                 )
             elif name == "sonar":
@@ -229,23 +265,39 @@ class AgentRunner:
                 question = args.get("question") or args.get("task") or ""
                 sonar_namespace = args.get("namespace") or namespace or "sonar"
                 tasks.append(
-                    self.tooling.use_sonar(
-                        project_key,
-                        question=question or "",
-                        namespace=sonar_namespace,
-                        pull_request=args.get("pull_request"),
-                        project_search=args.get("project_search"),
-                        issue_types=args.get("issue_types"),
-                        hotspot_status=args.get("hotspot_status"),
+                    _run_with_queue_wait(
+                        "sonar",
+                        self.tooling.use_sonar(
+                            project_key,
+                            question=question or "",
+                            namespace=sonar_namespace,
+                            pull_request=args.get("pull_request"),
+                            project_search=args.get("project_search"),
+                            issue_types=args.get("issue_types"),
+                            hotspot_status=args.get("hotspot_status"),
+                        ),
+                        enqueue_ms,
                     )
                 )
             elif name == "jira" and "jira" in tool_args:
                 args = tool_args["jira"]
-                tasks.append(self.tooling.use_jira(args["jql"], args.get("create")))
+                tasks.append(
+                    _run_with_queue_wait(
+                        "jira",
+                        self.tooling.use_jira(args["jql"], args.get("create")),
+                        enqueue_ms,
+                    )
+                )
             elif name == "rag":
                 args = tool_args.get("rag", {})
                 question = args.get("question") or args.get("task") or ""
-                tasks.append(asyncio.to_thread(self.tooling.use_rag, question, namespace))
+                tasks.append(
+                    _run_with_queue_wait(
+                        "rag",
+                        asyncio.to_thread(self.tooling.use_rag, question, namespace),
+                        enqueue_ms,
+                    )
+                )
         if not tasks:
             return []
         results = await asyncio.gather(*tasks)
@@ -285,11 +337,18 @@ class AgentRunner:
             logger.info("Local fix requested. Sonar result found=%s", sonar_res is not None)
             if sonar_res and isinstance(sonar_res.output, dict):
                 try:
-                    local_fix = await self.tooling.fix_sonar_locally(
-                        task,
-                        sonar_res.output,
-                        git_payload=git_res.output if git_res else None,
-                    )
+                    perf_start_ms = telemetry.monotonic_ms() if telemetry.perf_metrics_enabled() else None
+                    try:
+                        local_fix = await self.tooling.fix_sonar_locally(
+                            task,
+                            sonar_res.output,
+                            git_payload=git_res.output if git_res else None,
+                            commit_mode="per_issue",
+                        )
+                    finally:
+                        if perf_start_ms is not None:
+                            duration_ms = max(0, telemetry.monotonic_ms() - perf_start_ms)
+                            telemetry.log_latency("sonar_fix", duration_ms, telemetry.get_request_id())
                     results.append(local_fix)
                     logger.info("Local fix result: %s", local_fix.output)
                 except Exception as exc:
@@ -317,6 +376,71 @@ class AgentRunner:
             context_parts.append(f"{res.name}: {res.output}")
         context = "\n".join(context_parts) if context_parts else "No tools invoked."
         answer = await self.responder.generate(task, context)
+        try:
+            sonar_res = next((r for r in results if r.name == "sonar"), None)
+            if sonar_res and isinstance(sonar_res.output, dict):
+                pr_issues = (sonar_res.output.get("pr_issues") or {}).get("issues") or []
+                pr_hotspots = (sonar_res.output.get("pr_hotspots") or {}).get("hotspots") or []
+                pr_issues_count = sonar_res.output.get("pr_issues_count")
+                pr_hotspots_count = sonar_res.output.get("pr_hotspots_count")
+                counts = {
+                    "BUG": 0,
+                    "VULNERABILITY": 0,
+                    "CODE_SMELL": 0,
+                    "SECURITY_HOTSPOT": 0,
+                    "OTHER": 0,
+                }
+                for issue in pr_issues:
+                    issue_type = (issue.get("type") or "OTHER").upper()
+                    if issue_type not in counts:
+                        issue_type = "OTHER"
+                    counts[issue_type] += 1
+                rule_counts: Dict[str, int] = {}
+                for issue in pr_issues:
+                    rule_key = issue.get("rule") or issue.get("ruleKey") or issue.get("key") or "UNKNOWN"
+                    rule_counts[rule_key] = rule_counts.get(rule_key, 0) + 1
+                for hotspot in pr_hotspots:
+                    rule_key = hotspot.get("rule") or hotspot.get("ruleKey") or hotspot.get("key") or "UNKNOWN"
+                    rule_counts[rule_key] = rule_counts.get(rule_key, 0) + 1
+                if pr_hotspots_count is None:
+                    pr_hotspots_count = len(pr_hotspots)
+                if pr_issues_count is None:
+                    pr_issues_count = len(pr_issues)
+                counts["SECURITY_HOTSPOT"] += pr_hotspots_count
+                total = pr_issues_count + pr_hotspots_count
+                try:
+                    telemetry.record_sonar_counts(total, counts, rule_counts)
+                    telemetry.emit_pulse(
+                        "TASK",
+                        "OK",
+                        {
+                            "task": "sonar_summary",
+                            "stage": "complete",
+                            "request_id": telemetry.get_request_id(),
+                            "run_id": telemetry.get_sonar_run_id(),
+                            "total": total,
+                            "by_type": counts,
+                            "by_rule": rule_counts,
+                        },
+                    )
+                except Exception:
+                    pass
+                if total == 0:
+                    answer = (
+                        "AI-Generated Summary:\n\n"
+                        "There are a total of 0 SonarQube issues (including security hotspots) identified in this pull request. "
+                        "BUGs (0), VULNERABILITIES (0), CODE_SMELLS (0), SECURITY_HOTSPOTS (0). "
+                        "No fixes are required based on the current analysis."
+                    )
+                else:
+                    answer = (
+                        "AI-Generated Summary:\n\n"
+                        f"There are a total of {total} SonarQube issues (including security hotspots) identified in this pull request. "
+                        f"BUGs ({counts['BUG']}), VULNERABILITIES ({counts['VULNERABILITY']}), "
+                        f"CODE_SMELLS ({counts['CODE_SMELL']}), SECURITY_HOTSPOTS ({counts['SECURITY_HOTSPOT']})."
+                    )
+        except Exception:
+            pass
 
         # Post the generated summary back to the PR when requested/configured.
         if self._should_comment_summary(tool_args):
@@ -334,4 +458,8 @@ class AgentRunner:
                     results.append(ToolResult(name="pr_summary_comment", output={"error": str(exc)}))
 
         self.memory.append(memory_key, Message(role="assistant", content=answer))
+        try:
+            telemetry.set_sonar_run_id(None)
+        except Exception:
+            pass
         return {"answer": answer, "tools": [res.__dict__ for res in results], "memory_key": memory_key}
